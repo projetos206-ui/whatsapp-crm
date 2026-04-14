@@ -1,35 +1,24 @@
 const axios = require("axios");
 
-function cleanPhone(phone) {
-  if (!phone) return "";
-
-  return phone
-    .replace("@s.whatsapp.net", "")
-    .replace("@g.us", "")
-    .replace(/\D/g, "");
-}
-
 async function sendToBitrix({ phone, message, userId }) {
   try {
-    const clean = cleanPhone(phone);
+    const cleanPhone = phone.replace("@s.whatsapp.net", "");
 
     const url = `${process.env.BITRIX_URL}crm.lead.add.json`;
 
-    const payload = {
+    const res = await axios.post(url, {
       fields: {
-        TITLE: `WhatsApp ${clean}`,
-        PHONE: [{ VALUE: clean, VALUE_TYPE: "MOBILE" }],
+        TITLE: `WhatsApp ${cleanPhone}`,
+        PHONE: [{ VALUE: cleanPhone, VALUE_TYPE: "MOBILE" }],
         COMMENTS: message,
         ASSIGNED_BY_ID: userId
       }
-    };
+    });
 
-    const res = await axios.post(url, payload);
+    console.log("🚀 BITRIX OK:", res.data);
 
-    console.log("✅ Bitrix OK:", res.data);
   } catch (err) {
-    console.log("❌ Bitrix ERROR:");
-    console.log(err.response?.data || err.message);
+    console.log("❌ BITRIX ERROR:", err.response?.data || err.message);
   }
 }
 

@@ -2,9 +2,6 @@ const express = require("express");
 const router = express.Router();
 
 const bitrix = require("../services/bitrix");
-const routerSvc = require("../services/router");
-const dedup = require("../services/dedup");
-const evolution = require("../services/evolution");
 
 router.post("/evolution", async (req, res) => {
   try {
@@ -16,28 +13,29 @@ router.post("/evolution", async (req, res) => {
     if (!msg) return res.sendStatus(200);
 
     const text = msg.message?.conversation;
-    const jid = msg.key?.remoteJid;
-    const msgId = msg.key?.id;
+    const phone = msg.key?.remoteJid;
+    const fromMe = msg.key?.fromMe;
 
-    if (!text || !msgId || !jid) return res.sendStatus(200);
+    // 🚨 IGNORA MENSAGENS PRÓPRIAS
+    if (fromMe) return res.sendStatus(200);
 
-    if (dedup.isDuplicate(msgId)) return res.sendStatus(200);
+    if (!text || !phone) return res.sendStatus(200);
 
-    const instance = routerSvc.getInstance(instanceId);
+    console.log("📩 RECEBIDO:", text);
 
-    if (!instance) return res.sendStatus(200);
-
+    // 🚀 AQUI ESTAVA FALTANDO NO SEU SISTEMA
     await bitrix.sendToBitrix({
-      phone: jid,
+      phone,
       message: text,
-      userId: instance.bitrixUserId
+      userId: 1 // ou fixo para teste
     });
 
-    console.log("✅ ENVIADO PRO BITRIX:", text);
+    console.log("🚀 ENVIADO PRO BITRIX");
 
     res.sendStatus(200);
+
   } catch (err) {
-    console.log("❌ ERROR:", err);
+    console.log("❌ WEBHOOK ERROR:", err);
     res.sendStatus(500);
   }
 });
