@@ -1,54 +1,45 @@
-const evolutionService = require('../services/evolutionService');
-const bitrixService = require('../services/bitrixService');
 const { normalizePayload } = require('../utils/payloadNormalizer');
-const { isDuplicate, markProcessed } = require('../utils/deduplicator');
+const { processRealtimeMessage } = require('../sync/realtimeSync');
 const logger = require('../utils/logger');
 
+const MESSAGE_EVENTS = new Set(['messages.upsert', 'MESSAGES_UPSERT', 'message']);
+
+/**
+ * POST /webhook/evolution
+ *
+ * Sempre responde 200 OK imediatamente (requisito crítico).
+ * O processamento ocorre em background para não travar o webhook.
+ */
 async function handleEvolution(req, res) {
-  try {
-    const rawPayload = req.body;
+  // Responder 200 IMEDIATAMENTE — Evolution API não pode ficar aguardando
+  res.status(200).json({ status: 'received' });
 
-    logger.info('[Webhook] Payload recebido', {
-      event: rawPayload?.event,
-      instance: rawPayload?.instance,
-    });
+  const raw = req.body;
 
-    if (!evolutionService.isMessageEvent(rawPayload)) {
-      return res.status(200).json({ status: 'ignored' });
+  // Processar em background (fire-and-forget)
+  setImmediate(async () => {
+    try {
+      const event = raw?.event || raw?.type || '';
+
+      if (!MESSAGE_EVENTS.has(event)) {
+        logger.debug(`[Webhook] Evento ignorado: ${event}`);
+        return;
+      }
+
+      const normalized = normalizePayload(raw);
+      if (!normalized) {
+        logger.debug('[Webhook] Payload inválido ou sem dados suficientes');
+        return;
+      }
+
+      logger.info(`[Webhook] 📨 ${normalized.name} (${normalized.phone}) via ${normalized.instanceId}`);
+
+      await processRealtimeMessage(normalized);
+
+    } catch (err) {
+      logger.error('[Webhook] Erro no processamento background:', err.message);
     }
-
-    const normalized = normalizePayload(rawPayload);
-
-    if (!normalized) {
-      return res.status(200).json({ status: 'ignored' });
-    }
-
-    const { phone, name, message, instanceId, messageId } = normalized;
-
-    logger.info(`[Webhook] ${name} (${phone}) → ${message}`);
-
-    if (isDuplicate(messageId)) {
-      return res.status(200).json({ status: 'duplicate' });
-    }
-
-    markProcessed(messageId);
-
-    const result = await bitrixService.createOrUpdateLead({
-      phone,
-      name,
-      message,
-      instanceId,
-    });
-
-    return res.status(200).json({
-      status: 'success',
-      ...result,
-    });
-
-  } catch (error) {
-    logger.error('[Webhook] Erro:', error.message);
-    return res.status(200).json({ status: 'error' });
-  }
+  });
 }
 
 module.exports = { handleEvolution };

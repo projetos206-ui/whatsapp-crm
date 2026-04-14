@@ -1,8 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { getHealth } = require('../controllers/healthController');
 
-// GET /health
-router.get('/', getHealth);
+router.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'online',
+    service: 'Evolution → Bitrix Sync Engine',
+    timestamp: new Date().toISOString(),
+  });
+});
 
 module.exports = router;

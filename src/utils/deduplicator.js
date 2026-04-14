@@ -1,79 +1,63 @@
 /**
- * Deduplicador em memória com TTL
+ * Deduplicador com TTL — evita processar a mesma mensagem duas vezes
  *
- * Evita processar a mesma mensagem duas vezes caso a Evolution API
- * envie o webhook mais de uma vez (retry em falhas, por exemplo).
- *
- * ⚠️  Este cache é em memória (não persiste entre reinicializações).
- * Para produção com múltiplos servidores, substituir por Redis.
- *
- * TODO: Substituir por Redis quando escalar horizontalmente:
- *   await redis.set(`msg:${id}`, '1', 'EX', TTL_SECONDS);
- *   const exists = await redis.exists(`msg:${id}`);
+ * A Evolution API pode reenviar webhooks em caso de falha de rede.
+ * Este módulo rastreia IDs de mensagens já processadas com expiração automática.
  */
 
-const CACHE_TTL_MS = 5 * 60 * 1000;  // 5 minutos
-const MAX_CACHE_SIZE = 10_000;         // Limite de entradas em memória
+const logger = require('./logger');
 
-// Map: messageId → timestamp de quando foi processado
-const processedMessages = new Map();
+const TTL_MS = (parseInt(process.env.DEDUP_TTL_MINUTES || '5', 10)) * 60 * 1000;
+const MAX_SIZE = 50_000;
+
+// Map: messageId → timestamp
+const seen = new Map();
 
 /**
- * Verifica se a mensagem já foi processada
+ * Gera um ID único de mensagem a partir do payload Evolution
  */
+function buildMessageId(payload) {
+  const data = payload?.data || payload;
+  const key = data?.key || {};
+  // Usar o ID nativo da mensagem do Baileys
+  if (key?.id) return `${key.remoteJid || ''}_${key.id}`;
+  // Fallback: remoteJid + timestamp
+  const jid = key?.remoteJid || data?.remoteJid || '';
+  const ts  = data?.messageTimestamp || Date.now();
+  return `${jid}_${ts}`;
+}
+
 function isDuplicate(messageId) {
   if (!messageId) return false;
-
-  const processedAt = processedMessages.get(messageId);
-  if (!processedAt) return false;
-
-  // Expirou o TTL?
-  if (Date.now() - processedAt > CACHE_TTL_MS) {
-    processedMessages.delete(messageId);
+  const ts = seen.get(messageId);
+  if (!ts) return false;
+  if (Date.now() - ts > TTL_MS) {
+    seen.delete(messageId);
     return false;
   }
-
   return true;
 }
 
-/**
- * Marca mensagem como processada
- */
-function markProcessed(messageId) {
+function markSeen(messageId) {
   if (!messageId) return;
-
-  // Limpeza preventiva se cache muito grande
-  if (processedMessages.size >= MAX_CACHE_SIZE) {
-    pruneExpired();
-  }
-
-  processedMessages.set(messageId, Date.now());
+  if (seen.size >= MAX_SIZE) pruneExpired();
+  seen.set(messageId, Date.now());
 }
 
-/**
- * Remove entradas expiradas do cache
- */
 function pruneExpired() {
   const now = Date.now();
-  for (const [id, timestamp] of processedMessages.entries()) {
-    if (now - timestamp > CACHE_TTL_MS) {
-      processedMessages.delete(id);
-    }
+  let pruned = 0;
+  for (const [id, ts] of seen.entries()) {
+    if (now - ts > TTL_MS) { seen.delete(id); pruned++; }
   }
+  if (pruned > 0) logger.debug(`[Dedup] Removidas ${pruned} entradas expiradas`);
 }
 
-/**
- * Retorna estatísticas do cache (usado no /health)
- */
-function getCacheStats() {
-  return {
-    size: processedMessages.size,
-    maxSize: MAX_CACHE_SIZE,
-    ttlMinutes: CACHE_TTL_MS / 60000,
-  };
+function getStats() {
+  return { size: seen.size, maxSize: MAX_SIZE, ttlMinutes: TTL_MS / 60000 };
 }
 
-// Limpeza automática a cada 10 minutos
+// Limpeza periódica a cada 10min
 setInterval(pruneExpired, 10 * 60 * 1000);
 
-module.exports = { isDuplicate, markProcessed, getCacheStats };
+module.exports = { buildMessageId, isDuplicate, markSeen, getStats };

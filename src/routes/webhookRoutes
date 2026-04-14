@@ -1,0 +1,22 @@
+const express = require('express');
+const router = express.Router();
+
+// Recebe mensagens da Evolution API / WhatsApp
+router.post('/evolution', (req, res) => {
+  try {
+    const payload = req.body;
+
+    console.log('📩 Webhook Evolution recebido:', JSON.stringify(payload, null, 2));
+
+    // Aqui depois você vai integrar com Bitrix / n8n
+    return res.status(200).json({
+      success: true,
+      message: 'Webhook recebido com sucesso',
+    });
+  } catch (error) {
+    console.error('Erro webhook:', error);
+    return res.status(500).json({ success: false });
+  }
+});
+
+module.exports = router;

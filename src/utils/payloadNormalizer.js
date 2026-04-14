@@ -1,84 +1,68 @@
-const { extractInstanceId } = require('../services/evolutionService');
 const logger = require('./logger');
 
-function normalizePayload(rawPayload) {
+/**
+ * Normaliza o payload bruto da Evolution API para um formato canônico.
+ *
+ * Suporta Evolution API v1 e v2, bem como webhooks via Baileys direto.
+ */
+function normalizePayload(raw) {
   try {
-    const instanceId = extractInstanceId(rawPayload);
+    const data    = raw?.data || raw;
+    const key     = data?.key || {};
+    const msgContent = data?.message || {};
 
-    let messageData;
+    const remoteJid = key?.remoteJid || data?.remoteJid || '';
 
-    // 🔥 Compatível com todos formatos
-    if (rawPayload?.data?.messages?.length) {
-      messageData = rawPayload.data.messages[0];
-    } else if (rawPayload?.data?.key) {
-      messageData = rawPayload.data;
-    } else {
-      logger.warn('[Normalizer] Nenhuma mensagem encontrada');
-      return null;
-    }
-
-    const key = messageData?.key || {};
-    const msgContent = messageData?.message || {};
-
-    const remoteJid = key?.remoteJid || '';
-
-    // 🚫 Ignorar grupo
+    // Ignorar grupos
     if (remoteJid.includes('@g.us')) {
-      logger.info('[Normalizer] Grupo ignorado:', remoteJid);
+      logger.debug('[Normalizer] Mensagem de grupo ignorada:', remoteJid);
       return null;
     }
 
-    const phone = extractPhone(remoteJid);
+    // Ignorar mensagens enviadas pelo próprio número
+    if (key?.fromMe === true) {
+      logger.debug('[Normalizer] Mensagem fromMe ignorada');
+      return null;
+    }
+
+    const phone     = extractPhone(remoteJid);
     if (!phone) return null;
 
-    const name =
-      messageData?.pushName ||
-      messageData?.notifyName ||
-      `Contato ${phone}`;
+    const name      = data?.pushName || data?.name || `Contato ${phone}`;
+    const message   = extractText(msgContent, data);
+    const timestamp = data?.messageTimestamp || data?.timestamp || Math.floor(Date.now() / 1000);
+    const messageId = key?.id || `${remoteJid}_${timestamp}`;
+    const instanceId = raw?.instance || raw?.instanceName || 'default';
 
-    const message = extractMessageText(msgContent);
-    if (!message) return null;
-
-    const messageId = key?.id || `${phone}-${Date.now()}`;
-
-    return {
-      phone,
-      name,
-      message,
-      instanceId,
-      messageId,
-    };
-
-  } catch (error) {
-    logger.error('[Normalizer] Erro:', error.message);
+    return { phone, name, message, timestamp, messageId, instanceId, remoteJid };
+  } catch (err) {
+    logger.error('[Normalizer] Erro:', err.message);
     return null;
   }
 }
 
 function extractPhone(remoteJid) {
   if (!remoteJid) return null;
-
-  const raw = remoteJid.split('@')[0];
-  const digits = raw.replace(/\D/g, '');
-
+  const digits = remoteJid.split('@')[0].replace(/\D/g, '');
   if (!digits || digits.length < 8) return null;
-
-  if (digits.startsWith('55')) return `+${digits}`;
-
-  return `+55${digits}`;
+  return digits.startsWith('55') && digits.length >= 12 ? `+${digits}` : `+55${digits}`;
 }
 
-function extractMessageText(msg) {
+function extractText(msgContent, data) {
   return (
-    msg?.conversation ||
-    msg?.extendedTextMessage?.text ||
-    msg?.imageMessage?.caption ||
-    msg?.videoMessage?.caption ||
-    msg?.documentMessage?.caption ||
-    msg?.buttonsResponseMessage?.selectedDisplayText ||
-    msg?.listResponseMessage?.title ||
-    ''
+    msgContent?.conversation ||
+    msgContent?.extendedTextMessage?.text ||
+    msgContent?.imageMessage?.caption ||
+    msgContent?.videoMessage?.caption ||
+    msgContent?.documentMessage?.caption ||
+    msgContent?.audioMessage ? '🎤 Áudio' : null ||
+    msgContent?.stickerMessage ? '🎭 Sticker' : null ||
+    msgContent?.locationMessage ? '📍 Localização' : null ||
+    msgContent?.contactMessage ? '👤 Contato compartilhado' : null ||
+    data?.body ||
+    data?.text ||
+    '(mensagem sem texto)'
   );
 }
 
-module.exports = { normalizePayload };
+module.exports = { normalizePayload, extractPhone };
