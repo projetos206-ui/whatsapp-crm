@@ -58,7 +58,7 @@ async function handleEvolution(req, res) {
 
   } catch (error) {
     logger.error('[Webhook] Erro ao processar mensagem:', error.message);
-    return res.status(500).json({ status: 'error', message: 'Erro interno ao processar mensagem' });
+    return res.status(200).json({ status: 'ignored', reason: 'invalid_payload' });
   }
 }
 

@@ -1,100 +1,106 @@
 const axios = require('axios');
-const logger = require('../utils/logger');
-const { getInstanceLabel } = require('./evolutionService');
+const logger = console;
 
 const BITRIX_URL = process.env.BITRIX_WEBHOOK_URL;
 
-/**
- * Cria um lead no Bitrix24 via Webhook REST
- *
- * Documentação: https://apidocs.bitrix24.com/api-reference/crm/leads/crm-lead-add.html
- */
+// 🔎 Buscar lead por telefone
+async function findLeadByPhone(phone) {
+  const response = await axios.post(`${BITRIX_URL}crm.duplicate.findbycomm.json`, {
+    type: 'PHONE',
+    values: [phone],
+  });
+
+  return response.data?.result?.LEAD || [];
+}
+
+// ➕ Adicionar comentário no lead existente
+async function addCommentToLead(leadId, comment) {
+  await axios.post(`${BITRIX_URL}crm.timeline.comment.add.json`, {
+    fields: {
+      ENTITY_ID: leadId,
+      ENTITY_TYPE: 'lead',
+      COMMENT: comment,
+    },
+  });
+}
+
+// 🧱 Criar lead novo
 async function createLead({ phone, name, message, instanceId }) {
-  if (!BITRIX_URL) {
-    throw new Error('BITRIX_WEBHOOK_URL não configurada no .env');
-  }
-
-  const instanceLabel = getInstanceLabel(instanceId);
-
-  // ── Monta campos do lead ───────────────────────────────────────────────────
   const leadFields = {
     TITLE: `Lead WhatsApp - ${name}`,
     NAME: extractFirstName(name),
     LAST_NAME: extractLastName(name),
     PHONE: [{ VALUE: phone, VALUE_TYPE: 'WORK' }],
-    COMMENTS: buildComment({ message, instanceId, instanceLabel, phone }),
-    SOURCE_ID: 'WEB',                    // Fonte: Web (pode customizar)
-    STATUS_ID: 'NEW',                    // Status inicial: Novo
-    // Campos extras úteis:
-    // ASSIGNED_BY_ID: '1',             // ID do responsável no Bitrix
-    // UF_CRM_WHATSAPP_INSTANCE: instanceId, // Campo personalizado (criar no Bitrix)
+    COMMENTS: buildComment({ message, phone, instanceId }),
+    SOURCE_ID: 'WEB',
+    STATUS_ID: 'NEW',
   };
 
-  logger.info('[Bitrix] Criando lead:', { title: leadFields.TITLE, phone });
+  const response = await axios.post(`${BITRIX_URL}crm.lead.add.json`, {
+    fields: leadFields,
+  });
 
-  try {
-    const response = await axios.post(
-      `${BITRIX_URL}crm.lead.add.json`,
-      { fields: leadFields },
-      {
-        timeout: 10000,
-        headers: { 'Content-Type': 'application/json' },
-      }
-    );
+  const leadId = response.data?.result;
 
-    const leadId = response.data?.result;
-
-    if (!leadId) {
-      logger.warn('[Bitrix] Resposta inesperada:', response.data);
-      throw new Error('Bitrix24 não retornou ID do lead');
-    }
-
-    return { leadId, success: true };
-
-  } catch (error) {
-    // Erro HTTP do Bitrix
-    if (error.response) {
-      const bitrixError = error.response.data?.error_description || error.response.data?.error;
-      logger.error('[Bitrix] Erro da API:', bitrixError);
-      throw new Error(`Bitrix24 retornou erro: ${bitrixError}`);
-    }
-
-    // Timeout ou erro de rede
-    if (error.code === 'ECONNABORTED') {
-      logger.error('[Bitrix] Timeout ao conectar');
-      throw new Error('Timeout ao conectar com Bitrix24');
-    }
-
-    throw error;
+  if (!leadId) {
+    throw new Error('Erro ao criar lead no Bitrix');
   }
+
+  return { leadId, created: true };
 }
 
-/**
- * Monta o comentário do lead com contexto completo
- */
-function buildComment({ message, instanceId, instanceLabel, phone }) {
-  const now = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+// 🔄 Criar ou atualizar lead
+async function createOrUpdateLead(data) {
+  if (!BITRIX_URL) {
+    throw new Error('BITRIX_WEBHOOK_URL não configurada');
+  }
+
+  const existingLeads = await findLeadByPhone(data.phone);
+
+  const comment = buildComment({
+    message: data.message,
+    phone: data.phone,
+    instanceId: data.instanceId,
+  });
+
+  if (existingLeads.length > 0) {
+    const leadId = existingLeads[0];
+
+    logger.log('🔁 Lead já existe, adicionando comentário:', leadId);
+
+    await addCommentToLead(leadId, comment);
+
+    return { leadId, updated: true };
+  }
+
+  logger.log('🆕 Criando novo lead');
+
+  return await createLead(data);
+}
+
+// 🧾 Monta comentário
+function buildComment({ message, phone, instanceId }) {
+  const now = new Date().toLocaleString('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+  });
+
   return [
-    `📱 Mensagem recebida via WhatsApp`,
+    `📱 WhatsApp`,
+    `📅 ${now}`,
+    `📞 ${phone}`,
+    `🔌 Instância: ${instanceId}`,
     ``,
-    `📅 Data/Hora: ${now}`,
-    `📞 Número: ${phone}`,
-    `🔌 Instância: ${instanceLabel} (${instanceId})`,
-    ``,
-    `💬 Mensagem:`,
-    message || '(sem texto)',
+    `💬 ${message || '(sem texto)'}`,
   ].join('\n');
 }
 
-function extractFirstName(fullName) {
-  if (!fullName) return 'Contato';
-  return fullName.split(' ')[0];
+function extractFirstName(name) {
+  return name?.split(' ')[0] || 'Contato';
 }
 
-function extractLastName(fullName) {
-  if (!fullName) return 'WhatsApp';
-  const parts = fullName.split(' ');
-  return parts.length > 1 ? parts.slice(1).join(' ') : '';
+function extractLastName(name) {
+  const parts = name?.split(' ') || [];
+  return parts.length > 1 ? parts.slice(1).join(' ') : 'WhatsApp';
 }
 
-module.exports = { createLead };
+module.exports = { createOrUpdateLead };
