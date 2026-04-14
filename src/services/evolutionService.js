@@ -1,40 +1,30 @@
-/**
- * Serviço para interpretar payloads da Evolution API
- *
- * Eventos suportados:
- *  - messages.upsert   → nova mensagem recebida
- *  - messages.update   → status de mensagem atualizado (ignorar)
- *  - connection.update → status de conexão (ignorar)
- *  - qrcode.updated    → QR Code gerado (ignorar)
- */
-
 const MESSAGE_EVENTS = ['messages.upsert', 'MESSAGES_UPSERT'];
 
-/**
- * Verifica se o payload é um evento de mensagem nova
- */
 function isMessageEvent(payload) {
   if (!payload || !payload.event) return false;
 
-  // Ignorar mensagens enviadas pelo próprio número (fromMe)
-  const data = payload.data || payload;
-  const key = data?.key || data?.message?.key;
-  if (key?.fromMe === true) return false;
+  if (!MESSAGE_EVENTS.includes(payload.event)) return false;
 
-  return MESSAGE_EVENTS.includes(payload.event);
+  let msg;
+
+  if (payload?.data?.messages?.length) {
+    msg = payload.data.messages[0];
+  } else if (payload?.data?.key) {
+    msg = payload.data;
+  }
+
+  if (!msg) return false;
+
+  // 🚫 Ignorar mensagens enviadas por você mesmo
+  if (msg?.key?.fromMe === true) return false;
+
+  return true;
 }
 
-/**
- * Extrai o identificador único da instância WhatsApp
- * Permite mapear qual dos 7 números recebeu a mensagem
- */
 function extractInstanceId(payload) {
   return payload?.instance || payload?.instanceName || 'default';
 }
 
-/**
- * Mapeia instâncias para nomes amigáveis (configurar conforme seu setup)
- */
 const INSTANCE_MAP = {
   'instancia-1': 'Vendas',
   'instancia-2': 'Suporte',

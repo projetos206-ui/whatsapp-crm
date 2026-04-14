@@ -5,11 +5,15 @@ function normalizePayload(rawPayload) {
   try {
     const instanceId = extractInstanceId(rawPayload);
 
-    // 🔥 CORREÇÃO PRINCIPAL → acessar messages[0]
-    const messageData = rawPayload?.data?.messages?.[0];
+    let messageData;
 
-    if (!messageData) {
-      logger.warn('[Normalizer] Nenhuma mensagem encontrada no payload');
+    // 🔥 Compatível com todos formatos
+    if (rawPayload?.data?.messages?.length) {
+      messageData = rawPayload.data.messages[0];
+    } else if (rawPayload?.data?.key) {
+      messageData = rawPayload.data;
+    } else {
+      logger.warn('[Normalizer] Nenhuma mensagem encontrada');
       return null;
     }
 
@@ -18,34 +22,23 @@ function normalizePayload(rawPayload) {
 
     const remoteJid = key?.remoteJid || '';
 
-    // 🚫 Ignorar grupos
+    // 🚫 Ignorar grupo
     if (remoteJid.includes('@g.us')) {
-      logger.info('[Normalizer] Mensagem de grupo ignorada:', remoteJid);
+      logger.info('[Normalizer] Grupo ignorado:', remoteJid);
       return null;
     }
 
-    // 📞 Telefone
     const phone = extractPhone(remoteJid);
-    if (!phone) {
-      logger.warn('[Normalizer] Não foi possível extrair telefone:', remoteJid);
-      return null;
-    }
+    if (!phone) return null;
 
-    // 👤 Nome
     const name =
       messageData?.pushName ||
       messageData?.notifyName ||
       `Contato ${phone}`;
 
-    // 💬 Texto
     const message = extractMessageText(msgContent);
+    if (!message) return null;
 
-    if (!message) {
-      logger.warn('[Normalizer] Mensagem sem conteúdo útil');
-      return null;
-    }
-
-    // 🆔 ID único
     const messageId = key?.id || `${phone}-${Date.now()}`;
 
     return {
@@ -54,7 +47,6 @@ function normalizePayload(rawPayload) {
       message,
       instanceId,
       messageId,
-      remoteJid,
     };
 
   } catch (error) {
@@ -63,7 +55,6 @@ function normalizePayload(rawPayload) {
   }
 }
 
-// 📞 Extrair telefone
 function extractPhone(remoteJid) {
   if (!remoteJid) return null;
 
@@ -72,14 +63,11 @@ function extractPhone(remoteJid) {
 
   if (!digits || digits.length < 8) return null;
 
-  if (digits.startsWith('55')) {
-    return `+${digits}`;
-  }
+  if (digits.startsWith('55')) return `+${digits}`;
 
   return `+55${digits}`;
 }
 
-// 💬 Extrair texto
 function extractMessageText(msg) {
   return (
     msg?.conversation ||
