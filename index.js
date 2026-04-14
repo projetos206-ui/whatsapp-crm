@@ -1,24 +1,23 @@
-require('dotenv').config();
-const app = require('./src/app');
-const engine = require('./src/sync/engine');
-const logger = require('./src/utils/logger');
+const express = require("express");
+const bodyParser = require("body-parser");
+require("dotenv").config();
 
-const PORT = process.env.PORT || 3000;
+const webhook = require("./routes/webhook");
 
-async function bootstrap() {
-  // 1. Start HTTP server (webhook receiver)
-  app.listen(PORT, () => {
-    logger.info(`🚀 Sync Engine online — porta ${PORT}`);
-    logger.info(`📡 Webhook:     POST http://localhost:${PORT}/webhook/evolution`);
-    logger.info(`❤️  Health:      GET  http://localhost:${PORT}/health`);
-    logger.info(`🔄 Sync status: GET  http://localhost:${PORT}/sync/status`);
+const app = express();
+app.use(bodyParser.json());
+
+app.use("/webhook", webhook);
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    env: process.env.PORT
   });
+});
 
-  // 2. Start the sync engine (initialSync + realtimeSync ready)
-  await engine.start();
-}
+const PORT = process.env.PORT || 10000;
 
-bootstrap().catch((err) => {
-  logger.error('Fatal error on bootstrap:', err.message);
-  process.exit(1);
+app.listen(PORT, () => {
+  console.log("🚀 Server running on port", PORT);
 });
