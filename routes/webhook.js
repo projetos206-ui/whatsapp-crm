@@ -10,46 +10,36 @@ router.post("/evolution", async (req, res) => {
   try {
     const data = req.body;
 
-    const msgId = data.data?.key?.id;
+    const msg = data.data;
     const instanceId = data.instance;
-    const jid = data.data?.key?.remoteJid;
-    const text = data.data?.message?.conversation;
 
-    if (!msgId || !instanceId || !jid || !text) {
-      return res.sendStatus(200);
-    }
+    if (!msg) return res.sendStatus(200);
 
-    // 🔥 anti duplicação
-    if (dedup.isDuplicate(msgId)) {
-      return res.sendStatus(200);
-    }
+    const text = msg.message?.conversation;
+    const jid = msg.key?.remoteJid;
+    const msgId = msg.key?.id;
 
-    // 🔥 identificar atendente
+    if (!text || !msgId || !jid) return res.sendStatus(200);
+
+    if (dedup.isDuplicate(msgId)) return res.sendStatus(200);
+
     const instance = routerSvc.getInstance(instanceId);
+
     if (!instance) return res.sendStatus(200);
 
-    // 🔥 enviar para Bitrix
     await bitrix.sendToBitrix({
       phone: jid,
       message: text,
       userId: instance.bitrixUserId
     });
 
+    console.log("✅ ENVIADO PRO BITRIX:", text);
+
     res.sendStatus(200);
   } catch (err) {
-    console.log(err);
+    console.log("❌ ERROR:", err);
     res.sendStatus(500);
   }
-});
-
-
-// 📤 Bitrix → WhatsApp
-router.post("/send", async (req, res) => {
-  const { instance, phone, message } = req.body;
-
-  await evolution.sendMessage(instance, phone, message);
-
-  res.json({ ok: true });
 });
 
 module.exports = router;
