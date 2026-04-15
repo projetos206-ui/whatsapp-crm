@@ -25,6 +25,11 @@ const logger = winston.createLogger({
   ]
 });
 
+// ==================== Aumentar limite do payload ====================
+const app = express();
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
 // ==================== Cache ====================
 class LeadManager {
   constructor() {
@@ -62,7 +67,7 @@ class BitrixCRMService {
   async callMethod(method, params = {}) {
     try {
       const url = `${this.webhookUrl}${method}`;
-      logger.info(`📞 Chamando Bitrix24: ${method}`);
+      logger.debug(`Chamando Bitrix24: ${method}`);
       
       const response = await axios.post(url, params, {
         headers: { 'Content-Type': 'application/json' },
@@ -76,50 +81,40 @@ class BitrixCRMService {
       return response.data.result;
     } catch (error) {
       logger.error(`❌ Bitrix24 falhou: ${method} - ${error.message}`);
-      if (error.response?.data) {
-        logger.error(`Detalhes: ${JSON.stringify(error.response.data)}`);
-      }
       throw error;
     }
   }
 
-  async findOrCreateLead(phone, contactName, message) {
+  async findLeadByPhone(phone) {
     try {
       const formattedPhone = phone.replace(/[^0-9]/g, '');
       
-      // Buscar lead existente pelo telefone
-      const existingLeads = await this.callMethod('crm.lead.list', {
+      const result = await this.callMethod('crm.lead.list', {
         filter: { PHONE: formattedPhone },
         order: { DATE_CREATE: 'DESC' },
         select: ['ID', 'TITLE', 'STATUS_ID'],
         limit: 1
       });
       
-      if (existingLeads && existingLeads.length > 0) {
-        const leadId = existingLeads[0].ID;
-        logger.info(`✅ Lead existente encontrado: ${leadId}`);
-        
-        // Adicionar comentário no lead existente
-        await this.callMethod('crm.timeline.comment.add', {
-          fields: {
-            ENTITY_ID: leadId,
-            ENTITY_TYPE: 'lead',
-            COMMENT: `📱 *Nova mensagem WhatsApp*\n👤 ${contactName || phone}\n💬 ${message}\n🕐 ${new Date().toLocaleString('pt-BR')}`
-          }
-        });
-        
-        return leadId;
-      }
+      return result && result.length > 0 ? result[0].ID : null;
+    } catch (error) {
+      logger.warn(`Erro ao buscar lead: ${error.message}`);
+      return null;
+    }
+  }
+
+  async createLead(phone, contactName, message) {
+    try {
+      const formattedPhone = phone.replace(/[^0-9]/g, '');
+      const name = contactName || `Cliente ${formattedPhone}`;
       
-      // Criar novo lead
-      logger.info(`🆕 Criando novo lead para: ${contactName || phone}`);
       const leadData = {
-        TITLE: `WhatsApp: ${contactName || formattedPhone}`,
-        NAME: contactName || `Cliente ${formattedPhone}`,
+        TITLE: `WhatsApp: ${name}`,
+        NAME: name,
         PHONE: [{ VALUE: formattedPhone, VALUE_TYPE: 'WORK' }],
         SOURCE_ID: 'WEB',
         SOURCE_DESCRIPTION: `WhatsApp - ${new Date().toLocaleString('pt-BR')}`,
-        COMMENTS: `Primeira mensagem: ${message.substring(0, 500)}`,
+        COMMENTS: message.substring(0, 500),
         STATUS_ID: 'NEW'
       };
       
@@ -128,26 +123,17 @@ class BitrixCRMService {
         params: { REGISTER_SONET_EVENT: 'Y' }
       });
       
-      logger.info(`✅ Lead criado: ${newLead}`);
+      logger.info(`✅ Lead criado: ${newLead} - ${name}`);
       return newLead;
-      
     } catch (error) {
-      logger.error(`Erro ao processar lead: ${error.message}`);
+      logger.error(`Erro ao criar lead: ${error.message}`);
       throw error;
     }
   }
 
-  async addMessageToLead(leadId, contactName, message, direction = 'incoming') {
+  async addCommentToLead(leadId, contactName, message) {
     try {
-      const directionText = direction === 'incoming' ? '📥 Recebida' : '📤 Enviada';
-      const comment = `
-━━━━━━━━━━━━━━━━━━━
-${directionText}
-👤 ${contactName}
-💬 ${message}
-🕐 ${new Date().toLocaleString('pt-BR')}
-━━━━━━━━━━━━━━━━━━━
-      `;
+      const comment = `📱 ${message}`;
       
       await this.callMethod('crm.timeline.comment.add', {
         fields: {
@@ -157,11 +143,10 @@ ${directionText}
         }
       });
       
-      logger.info(`✅ Mensagem adicionada ao lead ${leadId}`);
+      logger.info(`✅ Comentário adicionado ao lead ${leadId}`);
       return true;
-      
     } catch (error) {
-      logger.error(`Erro ao adicionar mensagem: ${error.message}`);
+      logger.error(`Erro ao adicionar comentário: ${error.message}`);
       return false;
     }
   }
@@ -172,6 +157,32 @@ class EvolutionWebhookHandler {
   constructor(bitrixService, leadManager) {
     this.bitrixService = bitrixService;
     this.leadManager = leadManager;
+  }
+
+  extractMessageContent(messageData) {
+    // Tentar diferentes formatos de mensagem
+    if (messageData.conversation) {
+      return messageData.conversation;
+    }
+    if (messageData.extendedTextMessage?.text) {
+      return messageData.extendedTextMessage.text;
+    }
+    if (messageData.imageMessage?.caption) {
+      return `📷 Imagem: ${messageData.imageMessage.caption}`;
+    }
+    if (messageData.videoMessage?.caption) {
+      return `🎥 Vídeo: ${messageData.videoMessage.caption}`;
+    }
+    if (messageData.audioMessage) {
+      return `🎵 Áudio recebido`;
+    }
+    if (messageData.documentMessage) {
+      return `📄 Documento: ${messageData.documentMessage.fileName || 'arquivo'}`;
+    }
+    if (messageData.stickerMessage) {
+      return `🏷️ Sticker`;
+    }
+    return null;
   }
 
   async processMessage(instanceName, webhookData) {
@@ -189,23 +200,32 @@ class EvolutionWebhookHandler {
       }
       
       // Extrair nome
-      contactName = messageData.pushName || messageData.notifyName || messageData.senderName || null;
+      contactName = messageData.pushName || messageData.notifyName || null;
       
       // Extrair mensagem
-      if (messageData.message?.conversation) {
-        message = messageData.message.conversation;
-      } else if (messageData.message?.extendedTextMessage?.text) {
-        message = messageData.message.extendedTextMessage.text;
-      } else if (messageData.body) {
+      if (messageData.message) {
+        message = this.extractMessageContent(messageData.message);
+      }
+      
+      if (!message && messageData.body) {
         message = messageData.body;
-      } else if (messageData.text) {
+      }
+      
+      if (!message && messageData.text) {
         message = messageData.text;
-      } else {
+      }
+      
+      if (!message) {
         message = "📱 Mensagem recebida";
       }
       
-      if (!phone) {
-        logger.error(`❌ Não foi possível extrair telefone`);
+      // Limitar tamanho da mensagem
+      if (message.length > 500) {
+        message = message.substring(0, 500) + "...";
+      }
+      
+      if (!phone || phone.length < 10) {
+        logger.warn(`⚠️ Telefone inválido: ${phone}`);
         return;
       }
       
@@ -213,24 +233,29 @@ class EvolutionWebhookHandler {
       logger.info(`📨 Nova mensagem de: ${phone}`);
       logger.info(`👤 Nome: ${contactName || 'Não informado'}`);
       logger.info(`💬 Mensagem: ${message}`);
-      logger.info(`📡 Instância: ${instanceName}`);
       
-      // Verificar lead existente ou criar novo
-      let lead = this.leadManager.get(phone);
-      let leadId = null;
+      // Verificar lead existente
+      let leadId = this.leadManager.get(phone);
       
-      if (lead) {
-        leadId = lead.leadId;
-        logger.info(`📝 Lead encontrado na cache: ${leadId}`);
-        await this.bitrixService.addMessageToLead(leadId, contactName || phone, message, 'incoming');
+      if (!leadId) {
+        leadId = await this.bitrixService.findLeadByPhone(phone);
+        if (leadId) {
+          this.leadManager.set(phone, leadId);
+        }
+      }
+      
+      if (leadId) {
+        // Lead existe - adicionar comentário
+        await this.bitrixService.addCommentToLead(leadId, contactName || phone, message);
+        logger.info(`✅ Mensagem adicionada ao lead existente: ${leadId}`);
       } else {
-        logger.info(`🆕 Criando novo lead no CRM...`);
-        leadId = await this.bitrixService.findOrCreateLead(phone, contactName, message);
+        // Criar novo lead
+        leadId = await this.bitrixService.createLead(phone, contactName, message);
         this.leadManager.set(phone, leadId);
+        logger.info(`✅ Novo lead criado: ${leadId}`);
       }
       
       logger.info(`✅✅✅ MENSAGEM ENVIADA AO CRM! ✅✅✅`);
-      logger.info(`📊 Lead ID: ${leadId}`);
       logger.info(`========================================\n`);
       
     } catch (error) {
@@ -239,16 +264,10 @@ class EvolutionWebhookHandler {
   }
 }
 
-// ==================== Express App ====================
-const app = express();
+// ==================== Routes ====================
 const leadManager = new LeadManager();
 const bitrixService = new BitrixCRMService(process.env.BITRIX_WEBHOOK);
 const webhookHandler = new EvolutionWebhookHandler(bitrixService, leadManager);
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// ==================== Routes ====================
 
 app.get('/', (req, res) => {
   res.json({
@@ -313,8 +332,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 Servidor: https://whatsapp-crm-ewix.onrender.com`);
   console.log(`📨 Webhook: POST /webhook/evolution/:instanceName`);
   console.log(`💼 Modo: Enviando para LEADS do CRM`);
-  console.log(`✅ Status: ATIVO`);
+  console.log(`✅ Status: FUNCIONANDO`);
   console.log('========================================\n');
-  
-  logger.info(`✅ Bitrix24 Webhook: ${process.env.BITRIX_WEBHOOK ? 'Configurado' : 'FALTANDO!'}`);
 });
