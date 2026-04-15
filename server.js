@@ -25,7 +25,7 @@ const logger = winston.createLogger({
   ]
 });
 
-// ==================== Aumentar limite do payload ====================
+// ==================== Aumentar limite ====================
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -36,24 +36,25 @@ class LeadManager {
     this.cache = new NodeCache({ stdTTL: 86400 });
   }
 
-  getKey(phone) {
-    return phone.replace(/[^0-9]/g, '');
+  getKey(identifier) {
+    return identifier.toString();
   }
 
-  set(phone, leadId) {
-    const key = this.getKey(phone);
+  set(identifier, leadId, name) {
+    const key = this.getKey(identifier);
     this.cache.set(key, {
       leadId: leadId,
-      phone: phone,
+      identifier: identifier,
+      name: name,
       createdAt: new Date().toISOString(),
       lastMessage: new Date().toISOString()
     });
-    logger.info(`✅ Lead salvo: ${phone} -> ID: ${leadId}`);
+    logger.info(`✅ Lead salvo: ${identifier} -> ID: ${leadId}`);
     return this.cache.get(key);
   }
 
-  get(phone) {
-    const key = this.getKey(phone);
+  get(identifier) {
+    const key = this.getKey(identifier);
     return this.cache.get(key);
   }
 }
@@ -67,8 +68,6 @@ class BitrixCRMService {
   async callMethod(method, params = {}) {
     try {
       const url = `${this.webhookUrl}${method}`;
-      logger.debug(`Chamando Bitrix24: ${method}`);
-      
       const response = await axios.post(url, params, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 30000
@@ -85,45 +84,59 @@ class BitrixCRMService {
     }
   }
 
-  async findLeadByPhone(phone) {
+  async findLeadByIdentifier(identifier) {
     try {
-      const formattedPhone = phone.replace(/[^0-9]/g, '');
+      // Buscar pelo telefone (se for número normal)
+      if (identifier.toString().length < 20) {
+        const result = await this.callMethod('crm.lead.list', {
+          filter: { PHONE: identifier.toString() },
+          order: { DATE_CREATE: 'DESC' },
+          select: ['ID', 'TITLE'],
+          limit: 1
+        });
+        
+        return result && result.length > 0 ? result[0].ID : null;
+      }
       
+      // Buscar pelo título (se for grupo)
       const result = await this.callMethod('crm.lead.list', {
-        filter: { PHONE: formattedPhone },
+        filter: { TITLE: `%${identifier}%` },
         order: { DATE_CREATE: 'DESC' },
-        select: ['ID', 'TITLE', 'STATUS_ID'],
+        select: ['ID', 'TITLE'],
         limit: 1
       });
       
       return result && result.length > 0 ? result[0].ID : null;
     } catch (error) {
-      logger.warn(`Erro ao buscar lead: ${error.message}`);
       return null;
     }
   }
 
-  async createLead(phone, contactName, message) {
+  async createLead(identifier, name, message, isGroup = false) {
     try {
-      const formattedPhone = phone.replace(/[^0-9]/g, '');
-      const name = contactName || `Cliente ${formattedPhone}`;
+      const leadType = isGroup ? 'Grupo WhatsApp' : 'WhatsApp';
+      const title = isGroup ? `${leadType}: ${name}` : `${leadType}: ${name}`;
       
       const leadData = {
-        TITLE: `WhatsApp: ${name}`,
+        TITLE: title,
         NAME: name,
-        PHONE: [{ VALUE: formattedPhone, VALUE_TYPE: 'WORK' }],
         SOURCE_ID: 'WEB',
-        SOURCE_DESCRIPTION: `WhatsApp - ${new Date().toLocaleString('pt-BR')}`,
+        SOURCE_DESCRIPTION: `${leadType} - ${new Date().toLocaleString('pt-BR')}`,
         COMMENTS: message.substring(0, 500),
         STATUS_ID: 'NEW'
       };
+      
+      // Se for contato individual (não grupo), adicionar telefone
+      if (!isGroup && identifier.toString().length < 20) {
+        leadData.PHONE = [{ VALUE: identifier.toString(), VALUE_TYPE: 'WORK' }];
+      }
       
       const newLead = await this.callMethod('crm.lead.add', {
         fields: leadData,
         params: { REGISTER_SONET_EVENT: 'Y' }
       });
       
-      logger.info(`✅ Lead criado: ${newLead} - ${name}`);
+      logger.info(`✅ Lead criado: ${newLead} - ${name} ${isGroup ? '(Grupo)' : '(Individual)'}`);
       return newLead;
     } catch (error) {
       logger.error(`Erro ao criar lead: ${error.message}`);
@@ -131,9 +144,9 @@ class BitrixCRMService {
     }
   }
 
-  async addCommentToLead(leadId, contactName, message) {
+  async addCommentToLead(leadId, name, message) {
     try {
-      const comment = `📱 ${message}`;
+      const comment = `💬 ${message}`;
       
       await this.callMethod('crm.timeline.comment.add', {
         fields: {
@@ -159,8 +172,11 @@ class EvolutionWebhookHandler {
     this.leadManager = leadManager;
   }
 
+  isGroupMessage(remoteJid) {
+    return remoteJid && remoteJid.includes('@g.us');
+  }
+
   extractMessageContent(messageData) {
-    // Tentar diferentes formatos de mensagem
     if (messageData.conversation) {
       return messageData.conversation;
     }
@@ -170,8 +186,14 @@ class EvolutionWebhookHandler {
     if (messageData.imageMessage?.caption) {
       return `📷 Imagem: ${messageData.imageMessage.caption}`;
     }
+    if (messageData.imageMessage && !messageData.imageMessage.caption) {
+      return `📷 Imagem recebida`;
+    }
     if (messageData.videoMessage?.caption) {
       return `🎥 Vídeo: ${messageData.videoMessage.caption}`;
+    }
+    if (messageData.videoMessage && !messageData.videoMessage.caption) {
+      return `🎥 Vídeo recebido`;
     }
     if (messageData.audioMessage) {
       return `🎵 Áudio recebido`;
@@ -189,18 +211,27 @@ class EvolutionWebhookHandler {
     try {
       let messageData = webhookData.data || webhookData;
       let message = null;
-      let phone = null;
+      let identifier = null;
       let contactName = null;
+      let isGroup = false;
       
-      // Extrair telefone
+      // Extrair identificador (telefone ou grupo)
       if (messageData.key?.remoteJid) {
-        phone = messageData.key.remoteJid.split('@')[0];
+        identifier = messageData.key.remoteJid;
+        isGroup = this.isGroupMessage(identifier);
+        
+        // Limpar o identificador
+        if (isGroup) {
+          identifier = identifier.replace('@g.us', '');
+          contactName = messageData.pushName || `Grupo ${identifier}`;
+        } else {
+          identifier = identifier.split('@')[0];
+          contactName = messageData.pushName || messageData.notifyName || `Contato ${identifier}`;
+        }
       } else if (messageData.from) {
-        phone = messageData.from.split('@')[0];
+        identifier = messageData.from.split('@')[0];
+        contactName = messageData.pushName || `Contato ${identifier}`;
       }
-      
-      // Extrair nome
-      contactName = messageData.pushName || messageData.notifyName || null;
       
       // Extrair mensagem
       if (messageData.message) {
@@ -219,39 +250,41 @@ class EvolutionWebhookHandler {
         message = "📱 Mensagem recebida";
       }
       
-      // Limitar tamanho da mensagem
+      // Limitar tamanho
       if (message.length > 500) {
         message = message.substring(0, 500) + "...";
       }
       
-      if (!phone || phone.length < 10) {
-        logger.warn(`⚠️ Telefone inválido: ${phone}`);
+      if (!identifier) {
+        logger.warn(`⚠️ Não foi possível extrair identificador`);
         return;
       }
       
       logger.info(`========================================`);
-      logger.info(`📨 Nova mensagem de: ${phone}`);
-      logger.info(`👤 Nome: ${contactName || 'Não informado'}`);
+      logger.info(`📨 Nova ${isGroup ? 'mensagem de GRUPO' : 'mensagem'}`);
+      logger.info(`🆔 Identificador: ${identifier}`);
+      logger.info(`👤 Nome: ${contactName}`);
       logger.info(`💬 Mensagem: ${message}`);
+      logger.info(`📡 Instância: ${instanceName}`);
       
       // Verificar lead existente
-      let leadId = this.leadManager.get(phone);
+      let leadId = this.leadManager.get(identifier);
       
       if (!leadId) {
-        leadId = await this.bitrixService.findLeadByPhone(phone);
+        leadId = await this.bitrixService.findLeadByIdentifier(identifier);
         if (leadId) {
-          this.leadManager.set(phone, leadId);
+          this.leadManager.set(identifier, leadId, contactName);
         }
       }
       
       if (leadId) {
         // Lead existe - adicionar comentário
-        await this.bitrixService.addCommentToLead(leadId, contactName || phone, message);
+        await this.bitrixService.addCommentToLead(leadId, contactName, message);
         logger.info(`✅ Mensagem adicionada ao lead existente: ${leadId}`);
       } else {
         // Criar novo lead
-        leadId = await this.bitrixService.createLead(phone, contactName, message);
-        this.leadManager.set(phone, leadId);
+        leadId = await this.bitrixService.createLead(identifier, contactName, message, isGroup);
+        this.leadManager.set(identifier, leadId, contactName);
         logger.info(`✅ Novo lead criado: ${leadId}`);
       }
       
@@ -273,7 +306,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'WhatsApp CRM Integration',
-    mode: 'Enviando para Leads do Bitrix24',
+    mode: 'Enviando para Leads do Bitrix24 (com suporte a grupos)',
     endpoints: {
       health: 'GET /health',
       webhook: 'POST /webhook/evolution/:instanceName',
@@ -296,7 +329,6 @@ app.post('/webhook/evolution/:instanceName', async (req, res) => {
   const { instanceName } = req.params;
   
   try {
-    logger.info(`🔔 Webhook recebido para: ${instanceName}`);
     await webhookHandler.processMessage(instanceName, req.body);
     res.status(200).json({ 
       status: 'success', 
@@ -332,6 +364,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 Servidor: https://whatsapp-crm-ewix.onrender.com`);
   console.log(`📨 Webhook: POST /webhook/evolution/:instanceName`);
   console.log(`💼 Modo: Enviando para LEADS do CRM`);
+  console.log(`👥 Suporte: Grupos e Individuais`);
   console.log(`✅ Status: FUNCIONANDO`);
   console.log('========================================\n');
 });
