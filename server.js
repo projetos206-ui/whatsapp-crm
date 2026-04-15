@@ -21,16 +21,14 @@ const logger = winston.createLogger({
         winston.format.colorize(),
         winston.format.simple()
       )
-    }),
-    new winston.transports.File({ filename: 'error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'messages.log' })
+    })
   ]
 });
 
-// ==================== Cache para CHAT_IDs ====================
+// ==================== Cache ====================
 class ChatSessionManager {
   constructor() {
-    this.cache = new NodeCache({ stdTTL: 86400, checkperiod: 3600 });
+    this.cache = new NodeCache({ stdTTL: 86400 });
   }
 
   getKey(instance, phone) {
@@ -44,51 +42,28 @@ class ChatSessionManager {
       instance: instance,
       phone: phone,
       contactName: contactName,
-      createdAt: new Date().toISOString(),
-      lastMessageAt: new Date().toISOString()
+      createdAt: new Date().toISOString()
     });
-    logger.info(`✅ Chat salvo/atualizado: ${instance}:${phone} -> CHAT_ID: ${chatId}`);
+    logger.info(`✅ Chat salvo: ${instance}:${phone} -> ${chatId}`);
     return this.cache.get(key);
   }
 
   get(instance, phone) {
-    const key = this.getKey(instance, phone);
-    const session = this.cache.get(key);
-    if (session) {
-      session.lastMessageAt = new Date().toISOString();
-      this.cache.set(key, session);
-    }
-    return session;
-  }
-
-  updateContactName(instance, phone, contactName) {
-    const session = this.get(instance, phone);
-    if (session && !session.contactName) {
-      session.contactName = contactName;
-      this.set(instance, phone, session.chatId, contactName);
-      logger.info(`📝 Nome do contato atualizado: ${phone} -> ${contactName}`);
-    }
-  }
-
-  getAll() {
-    return this.cache.keys().reduce((acc, key) => {
-      acc[key] = this.cache.get(key);
-      return acc;
-    }, {});
+    return this.cache.get(this.getKey(instance, phone));
   }
 }
 
-// ==================== Bitrix24 Service ====================
+// ==================== Bitrix24 Service (Usando Chat comum) ====================
 class Bitrix24Service {
-  constructor(webhookUrl, lineId) {
+  constructor(webhookUrl) {
     this.webhookUrl = webhookUrl;
-    this.lineId = lineId;
   }
 
   async callMethod(method, params = {}) {
     try {
       const url = `${this.webhookUrl}${method}`;
-      logger.debug(`Chamando Bitrix24: ${method}`);
+      logger.info(`📞 Chamando Bitrix24: ${method}`);
+      logger.debug(`URL: ${url}`);
       
       const response = await axios.post(url, params, {
         headers: { 'Content-Type': 'application/json' },
@@ -101,128 +76,88 @@ class Bitrix24Service {
       
       return response.data.result;
     } catch (error) {
-      logger.error(`Bitrix24 API falhou: ${method}`, { error: error.message });
+      logger.error(`❌ Bitrix24 falhou: ${method} - ${error.message}`);
+      if (error.response?.data) {
+        logger.error(`Detalhes: ${JSON.stringify(error.response.data)}`);
+      }
       throw error;
     }
   }
 
-  async findExistingChat(phone, instanceName) {
+  async findOrCreateChat(phone, instanceName, contactName = null) {
     try {
-      // Buscar sessões existentes pelo USER_CODE
-      const userCode = `${instanceName}_${phone}`;
-      const result = await this.callMethod('imopenlines.session.list', {
-        filter: { USER_CODE: userCode },
-        order: { DATE_CREATE: 'DESC' },
-        limit: 1
+      const chatTitle = `WhatsApp ${phone} (${instanceName})`;
+      const chatUsers = [1]; // ID do usuário atual (admin)
+      
+      // Tentar buscar chats existentes
+      const existingChats = await this.callMethod('im.chat.list', {
+        filter: { TITLE: chatTitle }
       });
       
-      if (result && result.length > 0) {
-        logger.info(`✅ Chat existente encontrado: ${result[0].CHAT_ID}`);
-        return result[0].CHAT_ID;
+      if (existingChats && existingChats.length > 0) {
+        logger.info(`✅ Chat existente encontrado: ${existingChats[0].ID}`);
+        return existingChats[0].ID;
       }
       
-      return null;
+      // Criar novo chat
+      logger.info(`🆕 Criando novo chat: ${chatTitle}`);
+      const newChat = await this.callMethod('im.chat.add', {
+        TITLE: chatTitle,
+        USERS: chatUsers,
+        DESCRIPTION: `Chat automático do WhatsApp - Instância: ${instanceName}\nCliente: ${contactName || phone}`
+      });
+      
+      logger.info(`✅ Chat criado: ${newChat}`);
+      return newChat;
+      
     } catch (error) {
-      logger.warn(`Erro ao buscar chat existente: ${error.message}`);
-      return null;
-    }
-  }
-
-  async createChatSession(phone, instanceName, contactName = null) {
-    try {
-      const formattedPhone = phone.replace(/[^0-9]/g, '');
-      const userName = contactName ? contactName : `WhatsApp ${formattedPhone}`;
-      
-      const params = {
-        LINE_ID: this.lineId,
-        USER_CODE: `${instanceName}_${formattedPhone}`,
-        USER_NAME: userName,
-        USER_FIRST_NAME: contactName || "WhatsApp",
-        USER_LAST_NAME: formattedPhone,
-        USER_WORK_POSITION: `WhatsApp - Instância: ${instanceName}`
-      };
-      
-      logger.info(`🆕 Criando nova sessão para ${instanceName}:${formattedPhone}`);
-      const result = await this.callMethod('imopenlines.session.start', params);
-      
-      if (result && result.CHAT_ID) {
-        logger.info(`✅ Sessão criada: CHAT_ID ${result.CHAT_ID}`);
-        return result.CHAT_ID;
-      } else {
-        throw new Error('CHAT_ID não retornado');
-      }
-    } catch (error) {
-      logger.error(`Erro ao criar sessão: ${error.message}`);
+      logger.error(`Erro ao criar chat: ${error.message}`);
       throw error;
     }
   }
 
   async sendMessage(chatId, message, contactName = null) {
     if (!message || message.trim() === '') {
-      logger.warn(`Mensagem vazia ignorada`);
+      logger.warn(`⚠️ Mensagem vazia ignorada`);
       return;
     }
 
-    // Formatar mensagem com nome do contato se disponível
     let formattedMessage = message;
     if (contactName) {
-      formattedMessage = `*${contactName}:*\n${message}`;
+      formattedMessage = `👤 *${contactName}*\n${message}`;
     }
 
     const params = {
-      CHAT_ID: chatId,
+      DIALOG_ID: `chat${chatId}`,
       MESSAGE: formattedMessage,
       SYSTEM: 'N'
     };
     
-    const result = await this.callMethod('imopenlines.message.add', params);
-    logger.info(`✅ Mensagem enviada ao Bitrix24 - Chat: ${chatId}`);
+    logger.info(`📤 Enviando mensagem para chat: ${chatId}`);
+    const result = await this.callMethod('im.message.add', params);
+    logger.info(`✅ Mensagem enviada ao Bitrix24!`);
     return result;
   }
 }
 
-// ==================== Evolution API Webhook Handler ====================
+// ==================== Evolution API Handler ====================
 class EvolutionWebhookHandler {
   constructor(bitrixService, sessionManager) {
     this.bitrixService = bitrixService;
     this.sessionManager = sessionManager;
   }
 
-  async extractContactName(messageData) {
-    // Tentar extrair nome do contato de diferentes lugares
-    let contactName = null;
-    
-    if (messageData.pushName) {
-      contactName = messageData.pushName;
-    } else if (messageData.notifyName) {
-      contactName = messageData.notifyName;
-    } else if (messageData.senderName) {
-      contactName = messageData.senderName;
-    } else if (messageData.contactName) {
-      contactName = messageData.contactName;
-    }
-    
-    return contactName;
-  }
-
   async processMessage(instanceName, webhookData) {
     try {
-      logger.info(`📨 Webhook recebido - Instância: ${instanceName}`);
+      logger.info(`========================================`);
+      logger.info(`📨 Mensagem recebida - Instância: ${instanceName}`);
       
       let messageData = webhookData.data || webhookData;
       let message = null;
       let phone = null;
       let contactName = null;
-      let isGroup = false;
       
-      // Verificar se é grupo
-      if (messageData.key?.remoteJid?.includes('@g.us')) {
-        isGroup = true;
-        logger.info(`🚫 Ignorando mensagem de grupo`);
-        return;
-      }
-      
-      // Extrair número do telefone
+      // Extrair telefone
       if (messageData.key?.remoteJid) {
         phone = messageData.key.remoteJid.split('@')[0];
       } else if (messageData.from) {
@@ -231,82 +166,52 @@ class EvolutionWebhookHandler {
         phone = messageData.sender.split('@')[0];
       }
       
-      // Extrair nome do contato
-      contactName = await this.extractContactName(messageData);
+      // Extrair nome
+      contactName = messageData.pushName || messageData.notifyName || messageData.senderName || null;
       
-      // Extrair texto da mensagem
-      if (messageData.message) {
-        if (messageData.message.conversation) {
-          message = messageData.message.conversation;
-        } else if (messageData.message.extendedTextMessage?.text) {
-          message = messageData.message.extendedTextMessage.text;
-        } else if (messageData.message.imageMessage) {
-          message = `📷 *Imagem*\n${messageData.message.imageMessage.caption || 'Sem legenda'}`;
-        } else if (messageData.message.videoMessage) {
-          message = `🎥 *Vídeo*\n${messageData.message.videoMessage.caption || 'Sem legenda'}`;
-        } else if (messageData.message.audioMessage) {
-          message = `🎵 *Áudio*`;
-        } else if (messageData.message.documentMessage) {
-          message = `📄 *Documento*\n${messageData.message.documentMessage.fileName || 'Arquivo'}`;
-        } else {
-          message = `📱 *Mensagem recebida*`;
-        }
+      // Extrair mensagem
+      if (messageData.message?.conversation) {
+        message = messageData.message.conversation;
+      } else if (messageData.message?.extendedTextMessage?.text) {
+        message = messageData.message.extendedTextMessage.text;
       } else if (messageData.body) {
         message = messageData.body;
       } else if (messageData.text) {
         message = messageData.text;
+      } else {
+        message = "📱 Mensagem recebida";
       }
       
       if (!phone) {
-        logger.error(`❌ Não foi possível extrair telefone`);
+        logger.error(`❌ Não foi possível extrair o telefone!`);
         return;
       }
       
-      if (!message) {
-        message = `📱 *Mensagem recebida*`;
-      }
-      
       logger.info(`📱 Telefone: ${phone}`);
-      if (contactName) logger.info(`👤 Nome: ${contactName}`);
+      logger.info(`👤 Nome: ${contactName || 'Não informado'}`);
       logger.info(`💬 Mensagem: ${message.substring(0, 100)}`);
       
-      // Verificar se já existe chat
+      // Verificar cache
       let session = this.sessionManager.get(instanceName, phone);
       let chatId = null;
       
       if (session) {
-        // Chat já existe na cache
         chatId = session.chatId;
-        logger.info(`📝 Chat existente encontrado na cache: ${chatId}`);
-        
-        // Atualizar nome do contato se não tiver
-        if (contactName && !session.contactName) {
-          this.sessionManager.updateContactName(instanceName, phone, contactName);
-        }
+        logger.info(`📝 Chat encontrado na CACHE: ${chatId}`);
       } else {
-        // Buscar no Bitrix24 se já existe chat
-        logger.info(`🔍 Buscando chat existente no Bitrix24...`);
-        chatId = await this.bitrixService.findExistingChat(phone, instanceName);
-        
-        if (chatId) {
-          // Chat existe no Bitrix24
-          logger.info(`✅ Chat existente encontrado no Bitrix24: ${chatId}`);
-          session = this.sessionManager.set(instanceName, phone, chatId, contactName);
-        } else {
-          // Criar novo chat
-          logger.info(`🆕 Nenhum chat existente, criando novo...`);
-          chatId = await this.bitrixService.createChatSession(phone, instanceName, contactName);
-          session = this.sessionManager.set(instanceName, phone, chatId, contactName);
-        }
+        logger.info(`🆕 Criando/ Buscando chat no Bitrix24...`);
+        chatId = await this.bitrixService.findOrCreateChat(phone, instanceName, contactName);
+        session = this.sessionManager.set(instanceName, phone, chatId, contactName);
       }
       
-      // Enviar mensagem para o chat (sem criar novo contato)
+      // Enviar mensagem
       await this.bitrixService.sendMessage(chatId, message, contactName);
       
-      logger.info(`✅ Mensagem enviada ao CRM - Chat: ${chatId}`);
+      logger.info(`✅✅✅ MENSAGEM ENVIADA AO BITRIX24! ✅✅✅`);
+      logger.info(`========================================\n`);
       
     } catch (error) {
-      logger.error(`❌ Erro ao processar mensagem: ${error.message}`);
+      logger.error(`❌❌❌ ERRO: ${error.message} ❌❌❌`);
     }
   }
 }
@@ -314,51 +219,49 @@ class EvolutionWebhookHandler {
 // ==================== Express App ====================
 const app = express();
 const sessionManager = new ChatSessionManager();
-const bitrixService = new Bitrix24Service(
-  process.env.BITRIX_WEBHOOK,
-  process.env.BITRIX_LINE_ID
-);
+const bitrixService = new Bitrix24Service(process.env.BITRIX_WEBHOOK);
 const webhookHandler = new EvolutionWebhookHandler(bitrixService, sessionManager);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Logging middleware
-app.use((req, res, next) => {
-  logger.info(`${req.method} ${req.path}`);
-  next();
-});
-
 // ==================== Routes ====================
 
-// Health check
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    service: 'WhatsApp CRM Integration',
+    version: '2.0 - Chat Comum',
+    endpoints: {
+      health: 'GET /health',
+      webhook: 'POST /webhook/evolution/:instanceName',
+      sessions: 'GET /api/sessions',
+      test: 'GET /api/test'
+    }
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'online',
     timestamp: new Date().toISOString(),
-    activeChats: Object.keys(sessionManager.getAll()).length,
-    bitrix_configured: !!process.env.BITRIX_WEBHOOK,
-    line_id: process.env.BITRIX_LINE_ID
+    activeSessions: sessionManager.cache.keys().length,
+    bitrix_configured: !!process.env.BITRIX_WEBHOOK
   });
 });
 
-// Webhook para Evolution API
+// Webhook principal
 app.post('/webhook/evolution/:instanceName', async (req, res) => {
   const { instanceName } = req.params;
   
   try {
-    logger.info(`📨 Webhook recebido para instância: ${instanceName}`);
-    
-    // Processar mensagem
+    logger.info(`🔔 Webhook recebido para: ${instanceName}`);
     await webhookHandler.processMessage(instanceName, req.body);
-    
-    // Responder 200 para o Evolution API
     res.status(200).json({ 
       status: 'success', 
       message: 'Mensagem processada',
       timestamp: new Date().toISOString()
     });
-    
   } catch (error) {
     logger.error(`Erro no webhook: ${error.message}`);
     res.status(500).json({ 
@@ -368,34 +271,58 @@ app.post('/webhook/evolution/:instanceName', async (req, res) => {
   }
 });
 
-// Listar todas as sessões ativas
+// Endpoint de teste
+app.get('/api/test', async (req, res) => {
+  const testMessage = {
+    event: "messages.upsert",
+    data: {
+      key: { remoteJid: "5588999999999@s.whatsapp.net" },
+      pushName: "Cliente Teste",
+      message: { conversation: "Olá! Esta é uma mensagem de teste do sistema." }
+    }
+  };
+  
+  try {
+    await webhookHandler.processMessage('instance1', testMessage);
+    res.json({ 
+      success: true, 
+      message: 'Teste executado com sucesso. Verifique o Bitrix24!',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
 app.get('/api/sessions', (req, res) => {
-  const sessions = sessionManager.getAll();
+  const sessions = sessionManager.cache.keys().reduce((acc, key) => {
+    acc[key] = sessionManager.cache.get(key);
+    return acc;
+  }, {});
+  
   res.json({
     total: Object.keys(sessions).length,
     sessions: sessions
   });
 });
 
-// Limpar cache (útil para testes)
-app.post('/api/clear-cache', (req, res) => {
-  sessionManager.cache.flushAll();
-  logger.info('🗑️ Cache limpo');
-  res.json({ status: 'success', message: 'Cache limpo' });
-});
-
 // ==================== Start Server ====================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  logger.info(`🚀 Servidor iniciado na porta ${PORT}`);
-  logger.info(`📋 Configuração:`);
-  logger.info(`   - Bitrix24 Webhook: ${process.env.BITRIX_WEBHOOK ? '✅' : '❌'}`);
-  logger.info(`   - LINE_ID: ${process.env.BITRIX_LINE_ID || '❌'}`);
-  logger.info(`\n📌 Endpoints:`);
-  logger.info(`   POST /webhook/evolution/:instanceName`);
-  logger.info(`   GET /health`);
-  logger.info(`   GET /api/sessions`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('\n========================================');
+  console.log('🚀 WhatsApp CRM Integration v2.0');
+  console.log('========================================');
+  console.log(`📡 Porta: ${PORT}`);
+  console.log(`🌐 URL: https://whatsapp-crm-ewix.onrender.com`);
+  console.log(`❤️  Health: GET /health`);
+  console.log(`📨 Webhook: POST /webhook/evolution/:instanceName`);
+  console.log(`🧪 Teste: GET /api/test`);
+  console.log(`💬 Modo: Chat Comum do Bitrix24`);
+  console.log('========================================\n');
+  
+  logger.info(`✅ Bitrix24 Webhook: ${process.env.BITRIX_WEBHOOK ? 'Configurado' : 'FALTANDO!'}`);
 });
-
-module.exports = app;
