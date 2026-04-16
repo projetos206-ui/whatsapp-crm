@@ -30,44 +30,41 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// ==================== Cache ====================
-class LeadManager {
+// ==================== Cache para sessões do Open Channel ====================
+class SessionManager {
   constructor() {
     this.cache = new NodeCache({ stdTTL: 86400 });
   }
 
-  getKey(identifier) {
-    return identifier.toString();
-  }
-
-  set(identifier, leadId, name) {
-    const key = this.getKey(identifier);
-    this.cache.set(key, {
-      leadId: leadId,
-      identifier: identifier,
-      name: name,
-      createdAt: new Date().toISOString(),
-      lastMessage: new Date().toISOString()
+  set(phone, chatId, contactName) {
+    this.cache.set(phone, {
+      chatId: chatId,
+      phone: phone,
+      name: contactName,
+      createdAt: new Date().toISOString()
     });
-    logger.info(`✅ Lead salvo: ${identifier} -> ID: ${leadId}`);
-    return this.cache.get(key);
+    logger.info(`✅ Sessão salva: ${phone} -> CHAT_ID: ${chatId}`);
+    return this.cache.get(phone);
   }
 
-  get(identifier) {
-    const key = this.getKey(identifier);
-    return this.cache.get(key);
+  get(phone) {
+    return this.cache.get(phone);
   }
 }
 
-// ==================== Bitrix24 CRM Service ====================
-class BitrixCRMService {
-  constructor(webhookUrl) {
+// ==================== Bitrix24 Open Channel Service ====================
+class Bitrix24OpenChannelService {
+  constructor(webhookUrl, lineId) {
     this.webhookUrl = webhookUrl;
+    this.lineId = lineId;
   }
 
   async callMethod(method, params = {}) {
     try {
       const url = `${this.webhookUrl}${method}`;
+      logger.info(`📞 Chamando Bitrix24: ${method}`);
+      logger.debug(`Params: ${JSON.stringify(params)}`);
+      
       const response = await axios.post(url, params, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 30000
@@ -77,99 +74,75 @@ class BitrixCRMService {
         throw new Error(`Bitrix24 Error: ${JSON.stringify(response.data.error)}`);
       }
       
+      logger.info(`✅ Bitrix24 respondeu: ${method}`);
       return response.data.result;
     } catch (error) {
       logger.error(`❌ Bitrix24 falhou: ${method} - ${error.message}`);
+      if (error.response?.data) {
+        logger.error(`Detalhes: ${JSON.stringify(error.response.data)}`);
+      }
       throw error;
     }
   }
 
-  async findLeadByIdentifier(identifier) {
+  async findOrCreateSession(phone, contactName) {
     try {
-      // Buscar pelo telefone (se for número normal)
-      if (identifier.toString().length < 20) {
-        const result = await this.callMethod('crm.lead.list', {
-          filter: { PHONE: identifier.toString() },
-          order: { DATE_CREATE: 'DESC' },
-          select: ['ID', 'TITLE'],
-          limit: 1
-        });
-        
-        return result && result.length > 0 ? result[0].ID : null;
-      }
+      const formattedPhone = phone.replace(/[^0-9]/g, '');
+      const userCode = `whatsapp_${formattedPhone}`;
       
-      // Buscar pelo título (se for grupo)
-      const result = await this.callMethod('crm.lead.list', {
-        filter: { TITLE: `%${identifier}%` },
-        order: { DATE_CREATE: 'DESC' },
-        select: ['ID', 'TITLE'],
-        limit: 1
+      logger.info(`🔍 Buscando/criando sessão para: ${userCode}`);
+      logger.info(`LINE_ID: ${this.lineId}`);
+      
+      // Método correto para Open Channels
+      const result = await this.callMethod('imopenlines.session.start', {
+        LINE_ID: parseInt(this.lineId),
+        USER_CODE: userCode,
+        USER_NAME: contactName || formattedPhone,
+        USER_FIRST_NAME: contactName || "WhatsApp",
+        USER_LAST_NAME: formattedPhone,
+        USER_WORK_POSITION: `WhatsApp - ${formattedPhone}`
       });
       
-      return result && result.length > 0 ? result[0].ID : null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async createLead(identifier, name, message, isGroup = false) {
-    try {
-      const leadType = isGroup ? 'Grupo WhatsApp' : 'WhatsApp';
-      const title = isGroup ? `${leadType}: ${name}` : `${leadType}: ${name}`;
-      
-      const leadData = {
-        TITLE: title,
-        NAME: name,
-        SOURCE_ID: 'WEB',
-        SOURCE_DESCRIPTION: `${leadType} - ${new Date().toLocaleString('pt-BR')}`,
-        COMMENTS: message.substring(0, 500),
-        STATUS_ID: 'NEW'
-      };
-      
-      // Se for contato individual (não grupo), adicionar telefone
-      if (!isGroup && identifier.toString().length < 20) {
-        leadData.PHONE = [{ VALUE: identifier.toString(), VALUE_TYPE: 'WORK' }];
+      if (result && result.CHAT_ID) {
+        logger.info(`✅ Sessão encontrada/criada: CHAT_ID=${result.CHAT_ID}`);
+        return result.CHAT_ID;
+      } else {
+        throw new Error('CHAT_ID não retornado');
       }
       
-      const newLead = await this.callMethod('crm.lead.add', {
-        fields: leadData,
-        params: { REGISTER_SONET_EVENT: 'Y' }
-      });
-      
-      logger.info(`✅ Lead criado: ${newLead} - ${name} ${isGroup ? '(Grupo)' : '(Individual)'}`);
-      return newLead;
     } catch (error) {
-      logger.error(`Erro ao criar lead: ${error.message}`);
+      logger.error(`❌ Erro na sessão: ${error.message}`);
       throw error;
     }
   }
 
-  async addCommentToLead(leadId, name, message) {
-    try {
-      const comment = `💬 ${message}`;
-      
-      await this.callMethod('crm.timeline.comment.add', {
-        fields: {
-          ENTITY_ID: leadId,
-          ENTITY_TYPE: 'lead',
-          COMMENT: comment
-        }
-      });
-      
-      logger.info(`✅ Comentário adicionado ao lead ${leadId}`);
-      return true;
-    } catch (error) {
-      logger.error(`Erro ao adicionar comentário: ${error.message}`);
-      return false;
+  async sendMessage(chatId, message, contactName) {
+    if (!message || message.trim() === '') {
+      logger.warn(`⚠️ Mensagem vazia ignorada`);
+      return;
     }
+
+    // Formatar mensagem com nome do contato
+    const formattedMessage = `👤 *${contactName || 'Cliente'}*\n💬 ${message}`;
+    
+    const params = {
+      CHAT_ID: chatId,
+      MESSAGE: formattedMessage,
+      SYSTEM: 'N'
+    };
+    
+    logger.info(`📤 Enviando mensagem para CHAT: ${chatId}`);
+    const result = await this.callMethod('imopenlines.message.add', params);
+    logger.info(`✅ Mensagem enviada ao chat!`);
+    return result;
   }
 }
 
 // ==================== Evolution API Handler ====================
 class EvolutionWebhookHandler {
-  constructor(bitrixService, leadManager) {
+  constructor(bitrixService, sessionManager) {
     this.bitrixService = bitrixService;
-    this.leadManager = leadManager;
+    this.sessionManager = sessionManager;
   }
 
   isGroupMessage(remoteJid) {
@@ -211,26 +184,25 @@ class EvolutionWebhookHandler {
     try {
       let messageData = webhookData.data || webhookData;
       let message = null;
-      let identifier = null;
+      let phone = null;
       let contactName = null;
       let isGroup = false;
       
-      // Extrair identificador (telefone ou grupo)
+      // Extrair telefone
       if (messageData.key?.remoteJid) {
-        identifier = messageData.key.remoteJid;
-        isGroup = this.isGroupMessage(identifier);
+        const remoteJid = messageData.key.remoteJid;
+        isGroup = this.isGroupMessage(remoteJid);
         
-        // Limpar o identificador
         if (isGroup) {
-          identifier = identifier.replace('@g.us', '');
-          contactName = messageData.pushName || `Grupo ${identifier}`;
-        } else {
-          identifier = identifier.split('@')[0];
-          contactName = messageData.pushName || messageData.notifyName || `Contato ${identifier}`;
+          logger.info(`🚫 Ignorando mensagem de grupo: ${remoteJid}`);
+          return;
         }
+        
+        phone = remoteJid.split('@')[0];
+        contactName = messageData.pushName || messageData.notifyName || `Contato ${phone}`;
       } else if (messageData.from) {
-        identifier = messageData.from.split('@')[0];
-        contactName = messageData.pushName || `Contato ${identifier}`;
+        phone = messageData.from.split('@')[0];
+        contactName = messageData.pushName || `Contato ${phone}`;
       }
       
       // Extrair mensagem
@@ -255,40 +227,35 @@ class EvolutionWebhookHandler {
         message = message.substring(0, 500) + "...";
       }
       
-      if (!identifier) {
-        logger.warn(`⚠️ Não foi possível extrair identificador`);
+      if (!phone) {
+        logger.warn(`⚠️ Não foi possível extrair telefone`);
         return;
       }
       
       logger.info(`========================================`);
-      logger.info(`📨 Nova ${isGroup ? 'mensagem de GRUPO' : 'mensagem'}`);
-      logger.info(`🆔 Identificador: ${identifier}`);
+      logger.info(`📨 Nova mensagem de: ${phone}`);
       logger.info(`👤 Nome: ${contactName}`);
       logger.info(`💬 Mensagem: ${message}`);
       logger.info(`📡 Instância: ${instanceName}`);
       
-      // Verificar lead existente
-      let leadId = this.leadManager.get(identifier);
+      // Verificar sessão existente
+      let session = this.sessionManager.get(phone);
+      let chatId = null;
       
-      if (!leadId) {
-        leadId = await this.bitrixService.findLeadByIdentifier(identifier);
-        if (leadId) {
-          this.leadManager.set(identifier, leadId, contactName);
-        }
-      }
-      
-      if (leadId) {
-        // Lead existe - adicionar comentário
-        await this.bitrixService.addCommentToLead(leadId, contactName, message);
-        logger.info(`✅ Mensagem adicionada ao lead existente: ${leadId}`);
+      if (session) {
+        chatId = session.chatId;
+        logger.info(`📝 Sessão encontrada na cache: ${chatId}`);
       } else {
-        // Criar novo lead
-        leadId = await this.bitrixService.createLead(identifier, contactName, message, isGroup);
-        this.leadManager.set(identifier, leadId, contactName);
-        logger.info(`✅ Novo lead criado: ${leadId}`);
+        logger.info(`🆕 Criando nova sessão no Open Channel...`);
+        chatId = await this.bitrixService.findOrCreateSession(phone, contactName);
+        session = this.sessionManager.set(phone, chatId, contactName);
       }
       
-      logger.info(`✅✅✅ MENSAGEM ENVIADA AO CRM! ✅✅✅`);
+      // Enviar mensagem para o Open Channel
+      await this.bitrixService.sendMessage(chatId, message, contactName);
+      
+      logger.info(`✅✅✅ MENSAGEM ENVIADA AO OPEN CHANNEL! ✅✅✅`);
+      logger.info(`📊 CHAT_ID: ${chatId}`);
       logger.info(`========================================\n`);
       
     } catch (error) {
@@ -298,19 +265,22 @@ class EvolutionWebhookHandler {
 }
 
 // ==================== Routes ====================
-const leadManager = new LeadManager();
-const bitrixService = new BitrixCRMService(process.env.BITRIX_WEBHOOK);
-const webhookHandler = new EvolutionWebhookHandler(bitrixService, leadManager);
+const sessionManager = new SessionManager();
+const bitrixService = new Bitrix24OpenChannelService(
+  process.env.BITRIX_WEBHOOK,
+  process.env.BITRIX_LINE_ID
+);
+const webhookHandler = new EvolutionWebhookHandler(bitrixService, sessionManager);
 
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'WhatsApp CRM Integration',
-    mode: 'Enviando para Leads do Bitrix24 (com suporte a grupos)',
+    service: 'WhatsApp → Bitrix24 Open Channel',
+    mode: 'Enviando para OPEN CHANNEL (Bate-papo ao vivo)',
     endpoints: {
       health: 'GET /health',
       webhook: 'POST /webhook/evolution/:instanceName',
-      leads: 'GET /api/leads'
+      sessions: 'GET /api/sessions'
     }
   });
 });
@@ -319,8 +289,9 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'online',
     timestamp: new Date().toISOString(),
-    leads: leadManager.cache.keys().length,
-    bitrix_configured: !!process.env.BITRIX_WEBHOOK
+    activeSessions: sessionManager.cache.keys().length,
+    bitrix_configured: !!process.env.BITRIX_WEBHOOK,
+    line_id: process.env.BITRIX_LINE_ID
   });
 });
 
@@ -329,10 +300,11 @@ app.post('/webhook/evolution/:instanceName', async (req, res) => {
   const { instanceName } = req.params;
   
   try {
+    logger.info(`🔔 Webhook recebido para: ${instanceName}`);
     await webhookHandler.processMessage(instanceName, req.body);
     res.status(200).json({ 
       status: 'success', 
-      message: 'Mensagem enviada ao CRM',
+      message: 'Mensagem enviada ao Open Channel',
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -341,16 +313,16 @@ app.post('/webhook/evolution/:instanceName', async (req, res) => {
   }
 });
 
-// Ver leads criados
-app.get('/api/leads', (req, res) => {
-  const leads = leadManager.cache.keys().reduce((acc, key) => {
-    acc[key] = leadManager.cache.get(key);
+// Ver sessões ativas
+app.get('/api/sessions', (req, res) => {
+  const sessions = sessionManager.cache.keys().reduce((acc, key) => {
+    acc[key] = sessionManager.cache.get(key);
     return acc;
   }, {});
   
   res.json({
-    total: Object.keys(leads).length,
-    leads: leads
+    total: Object.keys(sessions).length,
+    sessions: sessions
   });
 });
 
@@ -359,12 +331,12 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log('\n========================================');
-  console.log('🚀 WhatsApp → Bitrix24 CRM');
+  console.log('🚀 WhatsApp → Bitrix24 Open Channel');
   console.log('========================================');
   console.log(`📡 Servidor: https://whatsapp-crm-ewix.onrender.com`);
   console.log(`📨 Webhook: POST /webhook/evolution/:instanceName`);
-  console.log(`💼 Modo: Enviando para LEADS do CRM`);
-  console.log(`👥 Suporte: Grupos e Individuais`);
+  console.log(`💬 Modo: Enviando para OPEN CHANNEL`);
+  console.log(`🆔 LINE_ID: ${process.env.BITRIX_LINE_ID || 'NÃO CONFIGURADO'}`);
   console.log(`✅ Status: FUNCIONANDO`);
   console.log('========================================\n');
 });
