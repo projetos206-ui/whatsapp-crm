@@ -346,7 +346,7 @@ const express = require('express');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const path = require('path');
-const NodeCache = require('node-cache');
+const { Pool } = require('pg');
 
 dotenv.config();
 
@@ -354,96 +354,57 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-// ==================== Cache separado por instância ====================
-class MultiInstanceCache {
-    constructor() {
-        this.conversations = {};
-        this.messages = {};
-        
-        // Inicializa cache para cada instância
-        for (let i = 1; i <= 7; i++) {
-            this.conversations[`instance${i}`] = new NodeCache({ stdTTL: 86400 });
-            this.messages[`instance${i}`] = new NodeCache({ stdTTL: 86400 });
-        }
-    }
+// ==================== Configuração do Banco de Dados ====================
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
 
-    saveMessage(instanceName, phone, message, direction, contactName = null) {
-        const key = `${phone}_messages`;
-        const existingMessages = this.messages[instanceName].get(key) || [];
+// Criar tabelas se não existirem
+async function initDatabase() {
+    try {
+        // Tabela de conversas
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS conversations (
+                id SERIAL PRIMARY KEY,
+                phone VARCHAR(50) NOT NULL,
+                contact_name VARCHAR(255),
+                instance_name VARCHAR(50) NOT NULL,
+                last_message TEXT,
+                last_time TIMESTAMP,
+                unread_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(instance_name, phone)
+            )
+        `);
         
-        existingMessages.push({
-            id: Date.now(),
-            message: message,
-            direction: direction,
-            timestamp: new Date().toISOString(),
-            status: direction === 'outbound' ? 'sent' : 'received'
-        });
+        // Tabela de mensagens
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                phone VARCHAR(50) NOT NULL,
+                instance_name VARCHAR(50) NOT NULL,
+                message TEXT NOT NULL,
+                direction VARCHAR(20) NOT NULL,
+                status VARCHAR(20) DEFAULT 'received',
+                timestamp TIMESTAMP DEFAULT NOW(),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
         
-        this.messages[instanceName].set(key, existingMessages.slice(-200));
+        // Índices para busca rápida
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_phone ON messages(phone)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_instance ON messages(instance_name)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_conversations_instance ON conversations(instance_name)`);
         
-        // Atualizar conversa
-        let conversation = this.conversations[instanceName].get(phone);
-        if (!conversation) {
-            conversation = {
-                phone: phone,
-                name: contactName || phone,
-                instanceName: instanceName,
-                lastMessage: message,
-                lastTime: new Date().toISOString(),
-                unreadCount: direction === 'inbound' ? 1 : 0
-            };
-        } else {
-            conversation.lastMessage = message;
-            conversation.lastTime = new Date().toISOString();
-            if (direction === 'inbound') {
-                conversation.unreadCount = (conversation.unreadCount || 0) + 1;
-            }
-            if (contactName && !conversation.name) {
-                conversation.name = contactName;
-            }
-        }
-        this.conversations[instanceName].set(phone, conversation);
-        
-        console.log(`💾 [${instanceName}] Mensagem salva: ${direction} - ${phone}`);
-        return true;
-    }
-
-    getConversations(instanceName = null) {
-        const result = [];
-        
-        if (instanceName) {
-            const keys = this.conversations[instanceName].keys();
-            for (const key of keys) {
-                const conv = this.conversations[instanceName].get(key);
-                if (conv) result.push(conv);
-            }
-        } else {
-            for (let i = 1; i <= 7; i++) {
-                const instName = `instance${i}`;
-                const keys = this.conversations[instName].keys();
-                for (const key of keys) {
-                    const conv = this.conversations[instName].get(key);
-                    if (conv) result.push(conv);
-                }
-            }
-        }
-        
-        return result.sort((a, b) => new Date(b.lastTime) - new Date(a.lastTime));
-    }
-
-    getMessages(instanceName, phone) {
-        const key = `${phone}_messages`;
-        return this.messages[instanceName].get(key) || [];
-    }
-
-    markAsRead(instanceName, phone) {
-        const conversation = this.conversations[instanceName].get(phone);
-        if (conversation) {
-            conversation.unreadCount = 0;
-            this.conversations[instanceName].set(phone, conversation);
-        }
+        console.log('✅ Banco de dados inicializado');
+    } catch (error) {
+        console.error('Erro ao inicializar banco:', error.message);
     }
 }
+
+initDatabase();
 
 // ==================== Configuração das Instâncias ====================
 const instances = {
@@ -453,145 +414,192 @@ const instances = {
         name: 'WhatsApp Vendas',
         phone: '+55 88 981118927'
     },
-    instance2: {
-        id: process.env.INSTANCE_2_ID,
-        apiKey: process.env.INSTANCE_2_API_KEY,
-        name: 'WhatsApp Suporte',
-        phone: '+55 11 99999-9992'
-    },
-    instance3: {
-        id: process.env.INSTANCE_3_ID,
-        apiKey: process.env.INSTANCE_3_API_KEY,
-        name: 'WhatsApp Financeiro',
-        phone: '+55 11 99999-9993'
-    },
-    instance4: {
-        id: process.env.INSTANCE_4_ID,
-        apiKey: process.env.INSTANCE_4_API_KEY,
-        name: 'WhatsApp Atendimento',
-        phone: '+55 11 99999-9994'
-    },
-    instance5: {
-        id: process.env.INSTANCE_5_ID,
-        apiKey: process.env.INSTANCE_5_API_KEY,
-        name: 'WhatsApp Comercial',
-        phone: '+55 11 99999-9995'
-    },
-    instance6: {
-        id: process.env.INSTANCE_6_ID,
-        apiKey: process.env.INSTANCE_6_API_KEY,
-        name: 'WhatsApp Marketing',
-        phone: '+55 11 99999-9996'
-    },
-    instance7: {
-        id: process.env.INSTANCE_7_ID,
-        apiKey: process.env.INSTANCE_7_API_KEY,
-        name: 'WhatsApp SAC',
-        phone: '+55 11 99999-9997'
-    }
+    instance2: { id: process.env.INSTANCE_2_ID, apiKey: process.env.INSTANCE_2_API_KEY, name: 'WhatsApp Suporte', phone: '+55 11 99999-9992' },
+    instance3: { id: process.env.INSTANCE_3_ID, apiKey: process.env.INSTANCE_3_API_KEY, name: 'WhatsApp Financeiro', phone: '+55 11 99999-9993' },
+    instance4: { id: process.env.INSTANCE_4_ID, apiKey: process.env.INSTANCE_4_API_KEY, name: 'WhatsApp Atendimento', phone: '+55 11 99999-9994' },
+    instance5: { id: process.env.INSTANCE_5_ID, apiKey: process.env.INSTANCE_5_API_KEY, name: 'WhatsApp Comercial', phone: '+55 11 99999-9995' },
+    instance6: { id: process.env.INSTANCE_6_ID, apiKey: process.env.INSTANCE_6_API_KEY, name: 'WhatsApp Marketing', phone: '+55 11 99999-9996' },
+    instance7: { id: process.env.INSTANCE_7_ID, apiKey: process.env.INSTANCE_7_API_KEY, name: 'WhatsApp SAC', phone: '+55 11 99999-9997' }
 };
 
 const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://129.121.54.24:8080';
-const cache = new MultiInstanceCache();
 
-// ==================== Helper: Extrair dados da mensagem ====================
-function extractMessageData(webhookData) {
-    const messageData = webhookData.data || webhookData;
-    let phone = null;
-    let message = null;
-    let contactName = null;
-    
-    // Extrair telefone
-    if (messageData.key?.remoteJid) {
-        const remoteJid = messageData.key.remoteJid;
-        if (remoteJid.includes('@g.us')) {
-            return { ignore: true, reason: 'group' };
+// ==================== Funções do Banco de Dados ====================
+
+// Salvar mensagem no banco
+async function saveMessageToDB(instanceName, phone, message, direction, contactName = null) {
+    try {
+        // Salvar mensagem
+        await pool.query(
+            `INSERT INTO messages (phone, instance_name, message, direction, timestamp) 
+             VALUES ($1, $2, $3, $4, $5)`,
+            [phone, instanceName, message, direction, new Date().toISOString()]
+        );
+        
+        // Atualizar ou criar conversa
+        const existing = await pool.query(
+            `SELECT * FROM conversations WHERE instance_name = $1 AND phone = $2`,
+            [instanceName, phone]
+        );
+        
+        if (existing.rows.length > 0) {
+            await pool.query(
+                `UPDATE conversations 
+                 SET last_message = $1, last_time = $2, 
+                     unread_count = unread_count + $3,
+                     contact_name = COALESCE($4, contact_name),
+                     updated_at = NOW()
+                 WHERE instance_name = $5 AND phone = $6`,
+                [message, new Date().toISOString(), direction === 'inbound' ? 1 : 0, contactName, instanceName, phone]
+            );
+        } else {
+            await pool.query(
+                `INSERT INTO conversations (phone, contact_name, instance_name, last_message, last_time, unread_count)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [phone, contactName || phone, instanceName, message, new Date().toISOString(), direction === 'inbound' ? 1 : 0]
+            );
         }
-        phone = remoteJid.split('@')[0];
-        contactName = messageData.pushName || messageData.notifyName || phone;
-    } else if (messageData.sender) {
-        phone = messageData.sender.split('@')[0];
-        contactName = messageData.pushName || phone;
+        
+        console.log(`💾 [${instanceName}] Mensagem salva no banco: ${phone}`);
+        return true;
+    } catch (error) {
+        console.error('Erro ao salvar no banco:', error.message);
+        return false;
     }
-    
-    // Ignorar reações
-    if (messageData.messageType === 'reactionMessage') {
-        return { ignore: true, reason: 'reaction' };
-    }
-    
-    // Extrair mensagem
-    if (messageData.message?.conversation) {
-        message = messageData.message.conversation;
-    } else if (messageData.message?.extendedTextMessage?.text) {
-        message = messageData.message.extendedTextMessage.text;
-    } else if (messageData.message?.imageMessage?.caption) {
-        message = `📷 Imagem: ${messageData.message.imageMessage.caption}`;
-    } else if (messageData.message?.imageMessage) {
-        message = `📷 Imagem recebida`;
-    } else if (messageData.message?.audioMessage) {
-        message = `🎵 Áudio recebido`;
-    } else if (messageData.message?.videoMessage) {
-        message = `🎥 Vídeo recebido`;
-    } else if (messageData.body) {
-        message = messageData.body;
-    } else {
-        message = null;
-    }
-    
-    return { phone, message, contactName, ignore: false };
 }
 
-// ==================== Webhook para todas as instâncias ====================
-app.post('/webhook/evolution/:instanceName', (req, res) => {
+// Buscar conversas do banco
+async function getConversationsFromDB(instanceName = null) {
+    try {
+        let query = `SELECT * FROM conversations`;
+        let params = [];
+        
+        if (instanceName) {
+            query += ` WHERE instance_name = $1`;
+            params.push(instanceName);
+        }
+        
+        query += ` ORDER BY last_time DESC`;
+        
+        const result = await pool.query(query, params);
+        return result.rows.map(row => ({
+            phone: row.phone,
+            name: row.contact_name || row.phone,
+            lastMessage: row.last_message,
+            lastTime: row.last_time,
+            unreadCount: row.unread_count,
+            instanceName: row.instance_name
+        }));
+    } catch (error) {
+        console.error('Erro ao buscar conversas:', error.message);
+        return [];
+    }
+}
+
+// Buscar mensagens de uma conversa
+async function getMessagesFromDB(instanceName, phone) {
+    try {
+        const result = await pool.query(
+            `SELECT * FROM messages 
+             WHERE instance_name = $1 AND phone = $2 
+             ORDER BY timestamp ASC`,
+            [instanceName, phone]
+        );
+        
+        return result.rows.map(row => ({
+            id: row.id,
+            message: row.message,
+            direction: row.direction,
+            timestamp: row.timestamp,
+            status: row.status
+        }));
+    } catch (error) {
+        console.error('Erro ao buscar mensagens:', error.message);
+        return [];
+    }
+}
+
+// Marcar conversa como lida
+async function markAsReadInDB(instanceName, phone) {
+    try {
+        await pool.query(
+            `UPDATE conversations SET unread_count = 0 WHERE instance_name = $1 AND phone = $2`,
+            [instanceName, phone]
+        );
+        return true;
+    } catch (error) {
+        console.error('Erro ao marcar como lida:', error.message);
+        return false;
+    }
+}
+
+// ==================== Webhook ====================
+app.post('/webhook/evolution/:instanceName', async (req, res) => {
     const { instanceName } = req.params;
     const webhookData = req.body;
     
     console.log(`📨 Webhook recebido para: ${instanceName}`);
     
-    // Verificar se instância existe
-    if (!instances[instanceName]) {
-        console.log(`⚠️ Instância desconhecida: ${instanceName}`);
-        return res.status(200).json({ status: 'ignored', reason: 'unknown_instance' });
+    try {
+        const messageData = webhookData.data || webhookData;
+        let phone = null;
+        let message = null;
+        let contactName = null;
+        
+        // Extrair telefone (ignorar grupos)
+        if (messageData.key?.remoteJid) {
+            const remoteJid = messageData.key.remoteJid;
+            if (remoteJid.includes('@g.us')) {
+                return res.status(200).json({ status: 'ignored', reason: 'group' });
+            }
+            phone = remoteJid.split('@')[0];
+            contactName = messageData.pushName || messageData.notifyName || phone;
+        } else if (messageData.sender) {
+            phone = messageData.sender.split('@')[0];
+            contactName = messageData.pushName || phone;
+        }
+        
+        // Extrair mensagem
+        if (messageData.message?.conversation) {
+            message = messageData.message.conversation;
+        } else if (messageData.message?.extendedTextMessage?.text) {
+            message = messageData.message.extendedTextMessage.text;
+        } else if (messageData.body) {
+            message = messageData.body;
+        } else {
+            message = "📱 Mensagem recebida";
+        }
+        
+        if (phone && message) {
+            await saveMessageToDB(instanceName, phone, message, 'inbound', contactName);
+            console.log(`✅ Mensagem de ${contactName} (${phone}) salva no banco`);
+        }
+        
+        res.status(200).json({ status: 'success' });
+    } catch (error) {
+        console.error('Erro no webhook:', error);
+        res.status(500).json({ status: 'error' });
     }
-    
-    const { phone, message, contactName, ignore, reason } = extractMessageData(webhookData);
-    
-    if (ignore) {
-        console.log(`🚫 Ignorando: ${reason}`);
-        return res.status(200).json({ status: 'ignored', reason });
-    }
-    
-    if (!phone || !message) {
-        console.log(`⚠️ Não foi possível extrair dados`);
-        return res.status(200).json({ status: 'ignored', reason: 'no_data' });
-    }
-    
-    console.log(`✅ ${instanceName} - ${contactName} (${phone}): ${message.substring(0, 50)}`);
-    
-    // Salvar no cache da instância correta
-    cache.saveMessage(instanceName, phone, message, 'inbound', contactName);
-    
-    res.status(200).json({ status: 'success' });
 });
 
 // ==================== Rotas da API ====================
 
-// Listar conversas (com filtro por instância)
-app.get('/api/conversations', (req, res) => {
-    const { instance } = req.query;
-    const conversations = cache.getConversations(instance);
+// Listar conversas
+app.get('/api/conversations', async (req, res) => {
+    const { instance = 'instance1' } = req.query;
+    const conversations = await getConversationsFromDB(instance);
     res.json({ conversations });
 });
 
-// Listar mensagens de uma conversa
-app.get('/api/messages', (req, res) => {
-    const { instanceName, phone } = req.query;
+// Listar mensagens
+app.get('/api/messages', async (req, res) => {
+    const { instanceName = 'instance1', phone } = req.query;
     
-    if (!instanceName || !phone) {
-        return res.status(400).json({ error: 'instanceName e phone são obrigatórios' });
+    if (!phone) {
+        return res.status(400).json({ error: 'Telefone não informado' });
     }
     
-    const messages = cache.getMessages(instanceName, phone);
+    const messages = await getMessagesFromDB(instanceName, phone);
     res.json({ messages });
 });
 
@@ -604,78 +612,56 @@ app.post('/api/send', async (req, res) => {
     }
     
     const instance = instances[instanceName];
-    if (!instance || !instance.id || !instance.apiKey) {
+    if (!instance?.id || !instance?.apiKey) {
         return res.status(400).json({ error: `Instância ${instanceName} não configurada` });
     }
     
     try {
-        // Enviar via Evolution API
-        const response = await axios.post(
+        await axios.post(
             `${EVOLUTION_URL}/message/sendText/${instance.id}`,
-            { number: phone, text: message, options: { delay: 1000 } },
+            { number: phone, text: message },
             { headers: { 'apikey': instance.apiKey, 'Content-Type': 'application/json' } }
         );
         
-        // Salvar mensagem enviada
-        cache.saveMessage(instanceName, phone, message, 'outbound');
+        await saveMessageToDB(instanceName, phone, message, 'outbound');
         
-        console.log(`📤 [${instanceName}] Mensagem enviada para ${phone}`);
+        console.log(`📤 Mensagem enviada para ${phone}`);
         res.json({ success: true });
     } catch (error) {
-        console.error(`Erro ao enviar [${instanceName}]:`, error.message);
-        res.status(500).json({ error: 'Erro ao enviar mensagem: ' + error.message });
+        console.error('Erro ao enviar:', error.message);
+        res.status(500).json({ error: 'Erro ao enviar mensagem' });
     }
 });
 
 // Marcar como lida
-app.post('/api/mark-read', (req, res) => {
+app.post('/api/mark-read', async (req, res) => {
     const { instanceName, phone } = req.body;
-    cache.markAsRead(instanceName, phone);
+    await markAsReadInDB(instanceName, phone);
     res.json({ success: true });
 });
 
-// Interface do chat
+// Interface
 app.get('/whatsapp-chat', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'whatsapp-chat.html'));
 });
 
-// Health check
-app.get('/health', (req, res) => {
-    const instancesStatus = {};
-    for (let i = 1; i <= 7; i++) {
-        const instName = `instance${i}`;
-        instancesStatus[instName] = {
-            configured: !!instances[instName]?.id,
-            conversations: cache.conversations[instName]?.keys()?.length || 0
-        };
-    }
-    
+app.get('/health', async (req, res) => {
+    const conversations = await getConversationsFromDB();
     res.json({
         status: 'online',
-        instances: instancesStatus,
+        conversations: conversations.length,
         timestamp: new Date().toISOString()
     });
 });
 
-// ==================== Start ====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n========================================`);
-    console.log(`🚀 WhatsApp CRM - Multi Instâncias`);
+    console.log(`🚀 WhatsApp CRM - Com Banco de Dados`);
     console.log(`========================================`);
     console.log(`📡 Porta: ${PORT}`);
     console.log(`📱 Interface: /whatsapp-chat`);
     console.log(`📨 Webhook: POST /webhook/evolution/:instanceName`);
-    console.log(`========================================`);
-    console.log(`📋 Instâncias configuradas:`);
-    for (let i = 1; i <= 7; i++) {
-        const instName = `instance${i}`;
-        const inst = instances[instName];
-        if (inst?.id && inst?.apiKey) {
-            console.log(`   ✅ ${instName}: ${inst.name} - ${inst.phone}`);
-        } else {
-            console.log(`   ⚠️ ${instName}: Não configurada`);
-        }
-    }
+    console.log(`💾 Banco: PostgreSQL`);
     console.log(`========================================\n`);
 });
