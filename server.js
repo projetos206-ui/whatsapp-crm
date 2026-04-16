@@ -346,7 +346,7 @@ const express = require('express');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const path = require('path');
-const { io } = require('socket.io-client');
+const NodeCache = require('node-cache');
 
 dotenv.config();
 
@@ -354,229 +354,305 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-// ==================== Configuração ====================
-const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://129.121.54.24:8080';
-const INSTANCE_ID = process.env.INSTANCE_ID || '464c3279-6c01-4a14-a69b-0a186a4b33c6';
-const API_KEY = process.env.INSTANCE_1_API_KEY || '6023E1E6630C-4248-A5CB-FF98F1BEC7BA';
-
-// Cache para armazenar conversas (já que não temos API REST)
-let conversationsCache = [];
-let messagesCache = {};
-
-// ==================== Conexão WebSocket com Evolution API ====================
-let socket = null;
-
-function connectWebSocket() {
-    console.log('🔌 Conectando ao WebSocket da Evolution API...');
-    
-    socket = io(EVOLUTION_URL, {
-        path: '/socket.io',
-        transports: ['websocket', 'polling'],
-        query: {
-            apikey: API_KEY,
-            instanceId: INSTANCE_ID
-        },
-        reconnection: true,
-        reconnectionAttempts: 10,
-        reconnectionDelay: 1000
-    });
-
-    socket.on('connect', () => {
-        console.log('✅ WebSocket conectado!');
+// ==================== Cache separado por instância ====================
+class MultiInstanceCache {
+    constructor() {
+        this.conversations = {};
+        this.messages = {};
         
-        // Entrar na sala da instância
-        socket.emit('join-instance', { instanceId: INSTANCE_ID });
-        
-        // Solicitar lista de chats
-        socket.emit('get-chats', { instanceId: INSTANCE_ID });
-    });
-
-    // Receber lista de chats
-    socket.on('chats', (data) => {
-        console.log('📱 Lista de chats recebida:', data?.length || 0);
-        if (data && Array.isArray(data)) {
-            conversationsCache = data.map(chat => ({
-                phone: chat.id?.replace('@s.whatsapp.net', '') || chat.number,
-                name: chat.name || chat.pushname || chat.id,
-                lastMessage: chat.lastMessage?.text || chat.lastMessage || '',
-                lastTime: chat.lastMessage?.timestamp ? new Date(chat.lastMessage.timestamp * 1000).toISOString() : new Date().toISOString(),
-                unreadCount: chat.unreadCount || 0
-            }));
+        // Inicializa cache para cada instância
+        for (let i = 1; i <= 7; i++) {
+            this.conversations[`instance${i}`] = new NodeCache({ stdTTL: 86400 });
+            this.messages[`instance${i}`] = new NodeCache({ stdTTL: 86400 });
         }
-    });
+    }
 
-    // Receber mensagens de um chat
-    socket.on('messages', (data) => {
-        console.log('💬 Mensagens recebidas');
-        if (data?.phone && data?.messages) {
-            messagesCache[data.phone] = data.messages.map(msg => ({
-                id: msg.id,
-                message: msg.text || msg.body || 'Mensagem',
-                direction: msg.fromMe ? 'outbound' : 'inbound',
-                timestamp: msg.timestamp ? new Date(msg.timestamp * 1000).toISOString() : new Date().toISOString(),
-                status: msg.status || 'sent'
-            }));
-        }
-    });
-
-    // Receber nova mensagem em tempo real
-    socket.on('message', (data) => {
-        console.log('📨 Nova mensagem recebida:', data);
+    saveMessage(instanceName, phone, message, direction, contactName = null) {
+        const key = `${phone}_messages`;
+        const existingMessages = this.messages[instanceName].get(key) || [];
         
-        // Atualizar cache
-        const phone = data.from?.replace('@s.whatsapp.net', '');
-        if (phone) {
-            const newMessage = {
-                id: data.id,
-                message: data.text || data.body || 'Mensagem',
-                direction: data.fromMe ? 'outbound' : 'inbound',
-                timestamp: new Date().toISOString(),
-                status: 'received'
+        existingMessages.push({
+            id: Date.now(),
+            message: message,
+            direction: direction,
+            timestamp: new Date().toISOString(),
+            status: direction === 'outbound' ? 'sent' : 'received'
+        });
+        
+        this.messages[instanceName].set(key, existingMessages.slice(-200));
+        
+        // Atualizar conversa
+        let conversation = this.conversations[instanceName].get(phone);
+        if (!conversation) {
+            conversation = {
+                phone: phone,
+                name: contactName || phone,
+                instanceName: instanceName,
+                lastMessage: message,
+                lastTime: new Date().toISOString(),
+                unreadCount: direction === 'inbound' ? 1 : 0
             };
-            
-            if (!messagesCache[phone]) messagesCache[phone] = [];
-            messagesCache[phone].unshift(newMessage);
-            
-            // Atualizar última mensagem na conversa
-            const convIndex = conversationsCache.findIndex(c => c.phone === phone);
-            if (convIndex >= 0) {
-                conversationsCache[convIndex].lastMessage = newMessage.message;
-                conversationsCache[convIndex].lastTime = new Date().toISOString();
-                conversationsCache[convIndex].unreadCount = (conversationsCache[convIndex].unreadCount || 0) + 1;
+        } else {
+            conversation.lastMessage = message;
+            conversation.lastTime = new Date().toISOString();
+            if (direction === 'inbound') {
+                conversation.unreadCount = (conversation.unreadCount || 0) + 1;
+            }
+            if (contactName && !conversation.name) {
+                conversation.name = contactName;
             }
         }
-    });
+        this.conversations[instanceName].set(phone, conversation);
+        
+        console.log(`💾 [${instanceName}] Mensagem salva: ${direction} - ${phone}`);
+        return true;
+    }
 
-    socket.on('disconnect', () => {
-        console.log('❌ WebSocket desconectado. Tentando reconectar...');
-        setTimeout(connectWebSocket, 3000);
-    });
+    getConversations(instanceName = null) {
+        const result = [];
+        
+        if (instanceName) {
+            const keys = this.conversations[instanceName].keys();
+            for (const key of keys) {
+                const conv = this.conversations[instanceName].get(key);
+                if (conv) result.push(conv);
+            }
+        } else {
+            for (let i = 1; i <= 7; i++) {
+                const instName = `instance${i}`;
+                const keys = this.conversations[instName].keys();
+                for (const key of keys) {
+                    const conv = this.conversations[instName].get(key);
+                    if (conv) result.push(conv);
+                }
+            }
+        }
+        
+        return result.sort((a, b) => new Date(b.lastTime) - new Date(a.lastTime));
+    }
 
-    socket.on('connect_error', (error) => {
-        console.error('Erro de conexão WebSocket:', error.message);
-    });
+    getMessages(instanceName, phone) {
+        const key = `${phone}_messages`;
+        return this.messages[instanceName].get(key) || [];
+    }
+
+    markAsRead(instanceName, phone) {
+        const conversation = this.conversations[instanceName].get(phone);
+        if (conversation) {
+            conversation.unreadCount = 0;
+            this.conversations[instanceName].set(phone, conversation);
+        }
+    }
 }
 
-// Iniciar conexão WebSocket
-connectWebSocket();
+// ==================== Configuração das Instâncias ====================
+const instances = {
+    instance1: {
+        id: process.env.INSTANCE_1_ID || '464c3279-6c01-4a14-a69b-0a186a4b33c6',
+        apiKey: process.env.INSTANCE_1_API_KEY,
+        name: 'WhatsApp Vendas',
+        phone: '+55 88 981118927'
+    },
+    instance2: {
+        id: process.env.INSTANCE_2_ID,
+        apiKey: process.env.INSTANCE_2_API_KEY,
+        name: 'WhatsApp Suporte',
+        phone: '+55 11 99999-9992'
+    },
+    instance3: {
+        id: process.env.INSTANCE_3_ID,
+        apiKey: process.env.INSTANCE_3_API_KEY,
+        name: 'WhatsApp Financeiro',
+        phone: '+55 11 99999-9993'
+    },
+    instance4: {
+        id: process.env.INSTANCE_4_ID,
+        apiKey: process.env.INSTANCE_4_API_KEY,
+        name: 'WhatsApp Atendimento',
+        phone: '+55 11 99999-9994'
+    },
+    instance5: {
+        id: process.env.INSTANCE_5_ID,
+        apiKey: process.env.INSTANCE_5_API_KEY,
+        name: 'WhatsApp Comercial',
+        phone: '+55 11 99999-9995'
+    },
+    instance6: {
+        id: process.env.INSTANCE_6_ID,
+        apiKey: process.env.INSTANCE_6_API_KEY,
+        name: 'WhatsApp Marketing',
+        phone: '+55 11 99999-9996'
+    },
+    instance7: {
+        id: process.env.INSTANCE_7_ID,
+        apiKey: process.env.INSTANCE_7_API_KEY,
+        name: 'WhatsApp SAC',
+        phone: '+55 11 99999-9997'
+    }
+};
+
+const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://129.121.54.24:8080';
+const cache = new MultiInstanceCache();
+
+// ==================== Helper: Extrair dados da mensagem ====================
+function extractMessageData(webhookData) {
+    const messageData = webhookData.data || webhookData;
+    let phone = null;
+    let message = null;
+    let contactName = null;
+    
+    // Extrair telefone
+    if (messageData.key?.remoteJid) {
+        const remoteJid = messageData.key.remoteJid;
+        if (remoteJid.includes('@g.us')) {
+            return { ignore: true, reason: 'group' };
+        }
+        phone = remoteJid.split('@')[0];
+        contactName = messageData.pushName || messageData.notifyName || phone;
+    } else if (messageData.sender) {
+        phone = messageData.sender.split('@')[0];
+        contactName = messageData.pushName || phone;
+    }
+    
+    // Ignorar reações
+    if (messageData.messageType === 'reactionMessage') {
+        return { ignore: true, reason: 'reaction' };
+    }
+    
+    // Extrair mensagem
+    if (messageData.message?.conversation) {
+        message = messageData.message.conversation;
+    } else if (messageData.message?.extendedTextMessage?.text) {
+        message = messageData.message.extendedTextMessage.text;
+    } else if (messageData.message?.imageMessage?.caption) {
+        message = `📷 Imagem: ${messageData.message.imageMessage.caption}`;
+    } else if (messageData.message?.imageMessage) {
+        message = `📷 Imagem recebida`;
+    } else if (messageData.message?.audioMessage) {
+        message = `🎵 Áudio recebido`;
+    } else if (messageData.message?.videoMessage) {
+        message = `🎥 Vídeo recebido`;
+    } else if (messageData.body) {
+        message = messageData.body;
+    } else {
+        message = null;
+    }
+    
+    return { phone, message, contactName, ignore: false };
+}
+
+// ==================== Webhook para todas as instâncias ====================
+app.post('/webhook/evolution/:instanceName', (req, res) => {
+    const { instanceName } = req.params;
+    const webhookData = req.body;
+    
+    console.log(`📨 Webhook recebido para: ${instanceName}`);
+    
+    // Verificar se instância existe
+    if (!instances[instanceName]) {
+        console.log(`⚠️ Instância desconhecida: ${instanceName}`);
+        return res.status(200).json({ status: 'ignored', reason: 'unknown_instance' });
+    }
+    
+    const { phone, message, contactName, ignore, reason } = extractMessageData(webhookData);
+    
+    if (ignore) {
+        console.log(`🚫 Ignorando: ${reason}`);
+        return res.status(200).json({ status: 'ignored', reason });
+    }
+    
+    if (!phone || !message) {
+        console.log(`⚠️ Não foi possível extrair dados`);
+        return res.status(200).json({ status: 'ignored', reason: 'no_data' });
+    }
+    
+    console.log(`✅ ${instanceName} - ${contactName} (${phone}): ${message.substring(0, 50)}`);
+    
+    // Salvar no cache da instância correta
+    cache.saveMessage(instanceName, phone, message, 'inbound', contactName);
+    
+    res.status(200).json({ status: 'success' });
+});
 
 // ==================== Rotas da API ====================
 
-// Listar conversas
+// Listar conversas (com filtro por instância)
 app.get('/api/conversations', (req, res) => {
-    const { instance = 'instance1' } = req.query;
-    
-    // Se tiver socket conectado, solicitar atualização
-    if (socket && socket.connected) {
-        socket.emit('get-chats', { instanceId: INSTANCE_ID });
-    }
-    
-    res.json({ conversations: conversationsCache });
+    const { instance } = req.query;
+    const conversations = cache.getConversations(instance);
+    res.json({ conversations });
 });
 
 // Listar mensagens de uma conversa
-app.get('/api/messages', async (req, res) => {
-    const { instanceName = 'instance1', phone } = req.query;
+app.get('/api/messages', (req, res) => {
+    const { instanceName, phone } = req.query;
     
-    if (!phone) {
-        return res.status(400).json({ error: 'Telefone não informado' });
+    if (!instanceName || !phone) {
+        return res.status(400).json({ error: 'instanceName e phone são obrigatórios' });
     }
     
-    // Se tiver em cache, retorna
-    if (messagesCache[phone]) {
-        return res.json({ messages: messagesCache[phone] });
-    }
-    
-    // Solicitar mensagens via WebSocket
-    if (socket && socket.connected) {
-        socket.emit('get-messages', { 
-            instanceId: INSTANCE_ID, 
-            phone: phone,
-            limit: 100
-        });
-        
-        // Aguardar um pouco para receber os dados
-        await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    
-    res.json({ messages: messagesCache[phone] || [] });
+    const messages = cache.getMessages(instanceName, phone);
+    res.json({ messages });
 });
 
-// Enviar mensagem via WebSocket
+// Enviar mensagem
 app.post('/api/send', async (req, res) => {
     const { instanceName, phone, message } = req.body;
     
-    if (!phone || !message) {
-        return res.status(400).json({ error: 'Telefone e mensagem são obrigatórios' });
+    if (!instanceName || !phone || !message) {
+        return res.status(400).json({ error: 'instanceName, phone e message são obrigatórios' });
     }
     
-    if (!socket || !socket.connected) {
-        return res.status(500).json({ error: 'WebSocket não conectado' });
+    const instance = instances[instanceName];
+    if (!instance || !instance.id || !instance.apiKey) {
+        return res.status(400).json({ error: `Instância ${instanceName} não configurada` });
     }
     
     try {
-        // Emitir evento para enviar mensagem
-        socket.emit('send-message', {
-            instanceId: INSTANCE_ID,
-            to: phone,
-            message: message,
-            type: 'text'
-        }, (response) => {
-            if (response && response.error) {
-                res.status(500).json({ error: response.error });
-            } else {
-                // Adicionar ao cache
-                const newMessage = {
-                    id: Date.now(),
-                    message: message,
-                    direction: 'outbound',
-                    timestamp: new Date().toISOString(),
-                    status: 'sent'
-                };
-                
-                if (!messagesCache[phone]) messagesCache[phone] = [];
-                messagesCache[phone].push(newMessage);
-                
-                res.json({ success: true, message: 'Enviado com sucesso' });
-            }
-        });
+        // Enviar via Evolution API
+        const response = await axios.post(
+            `${EVOLUTION_URL}/message/sendText/${instance.id}`,
+            { number: phone, text: message, options: { delay: 1000 } },
+            { headers: { 'apikey': instance.apiKey, 'Content-Type': 'application/json' } }
+        );
+        
+        // Salvar mensagem enviada
+        cache.saveMessage(instanceName, phone, message, 'outbound');
+        
+        console.log(`📤 [${instanceName}] Mensagem enviada para ${phone}`);
+        res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error(`Erro ao enviar [${instanceName}]:`, error.message);
+        res.status(500).json({ error: 'Erro ao enviar mensagem: ' + error.message });
     }
 });
 
 // Marcar como lida
 app.post('/api/mark-read', (req, res) => {
     const { instanceName, phone } = req.body;
-    
-    if (socket && socket.connected) {
-        socket.emit('mark-read', { instanceId: INSTANCE_ID, phone });
-        
-        const convIndex = conversationsCache.findIndex(c => c.phone === phone);
-        if (convIndex >= 0) {
-            conversationsCache[convIndex].unreadCount = 0;
-        }
-    }
-    
+    cache.markAsRead(instanceName, phone);
     res.json({ success: true });
 });
 
-// Webhook alternativo (se a Evolution chamar)
-app.post('/webhook/evolution/:instanceName', (req, res) => {
-    console.log('📨 Webhook recebido:', req.body);
-    res.json({ status: 'success' });
-});
-
-// Interface
+// Interface do chat
 app.get('/whatsapp-chat', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'whatsapp-chat.html'));
 });
 
+// Health check
 app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'online', 
-        websocket: socket ? (socket.connected ? 'connected' : 'disconnected') : 'not_initialized',
-        conversations: conversationsCache.length,
+    const instancesStatus = {};
+    for (let i = 1; i <= 7; i++) {
+        const instName = `instance${i}`;
+        instancesStatus[instName] = {
+            configured: !!instances[instName]?.id,
+            conversations: cache.conversations[instName]?.keys()?.length || 0
+        };
+    }
+    
+    res.json({
+        status: 'online',
+        instances: instancesStatus,
         timestamp: new Date().toISOString()
     });
 });
@@ -585,8 +661,21 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n========================================`);
-    console.log(`🚀 Servidor rodando na porta ${PORT}`);
-    console.log(`📱 Interface: http://localhost:${PORT}/whatsapp-chat`);
-    console.log(`🔌 WebSocket: ${socket ? (socket.connected ? 'Conectado' : 'Conectando...') : 'Inicializando...'}`);
+    console.log(`🚀 WhatsApp CRM - Multi Instâncias`);
+    console.log(`========================================`);
+    console.log(`📡 Porta: ${PORT}`);
+    console.log(`📱 Interface: /whatsapp-chat`);
+    console.log(`📨 Webhook: POST /webhook/evolution/:instanceName`);
+    console.log(`========================================`);
+    console.log(`📋 Instâncias configuradas:`);
+    for (let i = 1; i <= 7; i++) {
+        const instName = `instance${i}`;
+        const inst = instances[instName];
+        if (inst?.id && inst?.apiKey) {
+            console.log(`   ✅ ${instName}: ${inst.name} - ${inst.phone}`);
+        } else {
+            console.log(`   ⚠️ ${instName}: Não configurada`);
+        }
+    }
     console.log(`========================================\n`);
 });
