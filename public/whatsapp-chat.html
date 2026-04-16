@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp CRM - Espelho</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: #f0f2f5;
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Sidebar - Lista de conversas */
+        .sidebar {
+            width: 380px;
+            background: #fff;
+            border-right: 1px solid #e9ecef;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        .sidebar-header {
+            background: #f0f2f5;
+            padding: 20px 16px;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .sidebar-header h2 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #111b21;
+        }
+
+        .search-box {
+            padding: 12px 16px;
+            background: #fff;
+        }
+
+        .search-box input {
+            width: 100%;
+            padding: 10px 16px;
+            border: none;
+            background: #f0f2f5;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+
+        .conversations-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .conversation-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+            border-bottom: 1px solid #f0f2f5;
+        }
+
+        .conversation-item:hover {
+            background: #f5f6f6;
+        }
+
+        .conversation-item.active {
+            background: #e9ecef;
+        }
+
+        .avatar {
+            width: 49px;
+            height: 49px;
+            border-radius: 50%;
+            background: #25D366;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 18px;
+            margin-right: 15px;
+        }
+
+        .conversation-info {
+            flex: 1;
+        }
+
+        .conversation-name {
+            font-weight: 600;
+            color: #111b21;
+            margin-bottom: 4px;
+        }
+
+        .conversation-last-message {
+            font-size: 13px;
+            color: #667781;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 200px;
+        }
+
+        .conversation-time {
+            font-size: 11px;
+            color: #667781;
+        }
+
+        /* Chat Area */
+        .chat-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #efeae2;
+            height: 100vh;
+        }
+
+        .chat-header {
+            background: #f0f2f5;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .chat-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #25D366;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            margin-right: 15px;
+        }
+
+        .chat-info h3 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #111b21;
+        }
+
+        .chat-info p {
+            font-size: 13px;
+            color: #667781;
+        }
+
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .message {
+            max-width: 65%;
+            margin-bottom: 12px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .message.incoming {
+            align-items: flex-start;
+        }
+
+        .message.outgoing {
+            align-items: flex-end;
+            margin-left: auto;
+        }
+
+        .message-bubble {
+            padding: 8px 12px;
+            border-radius: 8px;
+            word-wrap: break-word;
+            position: relative;
+        }
+
+        .message.incoming .message-bubble {
+            background: #fff;
+            border-radius: 8px 8px 8px 0;
+        }
+
+        .message.outgoing .message-bubble {
+            background: #dcf8c5;
+            border-radius: 8px 8px 0 8px;
+        }
+
+        .message-text {
+            font-size: 14px;
+            color: #111b21;
+        }
+
+        .message-time {
+            font-size: 10px;
+            color: #667781;
+            margin-top: 4px;
+        }
+
+        .input-area {
+            background: #f0f2f5;
+            padding: 12px 20px;
+            display: flex;
+            gap: 10px;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .input-area input {
+            flex: 1;
+            padding: 10px 16px;
+            border: none;
+            border-radius: 20px;
+            background: #fff;
+            font-size: 14px;
+        }
+
+        .input-area input:focus {
+            outline: none;
+        }
+
+        .input-area button {
+            background: #25D366;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .input-area button:hover {
+            background: #128C7E;
+        }
+
+        .empty-state {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            color: #667781;
+        }
+
+        .status {
+            font-size: 12px;
+            padding: 4px 8px;
+            border-radius: 12px;
+            margin-top: 4px;
+        }
+
+        .status.online {
+            background: #25D366;
+            color: white;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #667781;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <h2>WhatsApp CRM</h2>
+        </div>
+        <div class="search-box">
+            <input type="text" id="searchInput" placeholder="Pesquisar conversa...">
+        </div>
+        <div class="conversations-list" id="conversationsList">
+            <div class="loading">Carregando conversas...</div>
+        </div>
+    </div>
+
+    <div class="chat-area" id="chatArea" style="display: none;">
+        <div class="chat-header" id="chatHeader">
+            <div class="chat-avatar" id="chatAvatar">?</div>
+            <div class="chat-info">
+                <h3 id="chatName">Selecione uma conversa</h3>
+                <p id="chatStatus">Clique em uma conversa para começar</p>
+            </div>
+        </div>
+        <div class="messages-container" id="messagesContainer">
+            <div class="empty-state">
+                <div>
+                    <p>Selecione uma conversa</p>
+                    <p style="font-size: 12px;">para começar a conversar</p>
+                </div>
+            </div>
+        </div>
+        <div class="input-area">
+            <input type="text" id="messageInput" placeholder="Digite sua mensagem...">
+            <button onclick="sendMessage()">Enviar</button>
+        </div>
+    </div>
+
+    <script>
+        let currentPhone = null;
+        let conversations = [];
+        let pollInterval = null;
+
+        // Carregar conversas do backend
+        async function loadConversations() {
+            try {
+                const response = await fetch('/api/conversations');
+                const data = await response.json();
+                conversations = data.conversations || [];
+                renderConversations();
+            } catch (error) {
+                console.error('Erro ao carregar conversas:', error);
+            }
+        }
+
+        // Renderizar lista de conversas
+        function renderConversations() {
+            const container = document.getElementById('conversationsList');
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            
+            const filtered = conversations.filter(conv => 
+                conv.name.toLowerCase().includes(searchTerm) || 
+                conv.phone.includes(searchTerm)
+            );
+
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="loading">Nenhuma conversa encontrada</div>';
+                return;
+            }
+
+            container.innerHTML = filtered.map(conv => `
+                <div class="conversation-item" onclick="selectConversation('${conv.phone}', '${conv.name}')">
+                    <div class="avatar">${conv.name.charAt(0).toUpperCase()}</div>
+                    <div class="conversation-info">
+                        <div class="conversation-name">${escapeHtml(conv.name)}</div>
+                        <div class="conversation-last-message">${escapeHtml(conv.lastMessage || 'Clique para abrir')}</div>
+                    </div>
+                    <div class="conversation-time">${conv.lastTime || ''}</div>
+                </div>
+            `).join('');
+        }
+
+        // Selecionar uma conversa
+        async function selectConversation(phone, name) {
+            currentPhone = phone;
+            
+            document.getElementById('chatArea').style.display = 'flex';
+            document.getElementById('chatName').innerText = name;
+            document.getElementById('chatAvatar').innerText = name.charAt(0).toUpperCase();
+            
+            await loadMessages(phone);
+            startPolling(phone);
+        }
+
+        // Carregar mensagens de uma conversa
+        async function loadMessages(phone) {
+            try {
+                const response = await fetch(`/api/messages?phone=${phone}`);
+                const data = await response.json();
+                renderMessages(data.messages || []);
+            } catch (error) {
+                console.error('Erro ao carregar mensagens:', error);
+            }
+        }
+
+        // Renderizar mensagens
+        function renderMessages(messages) {
+            const container = document.getElementById('messagesContainer');
+            
+            if (messages.length === 0) {
+                container.innerHTML = '<div class="empty-state"><div><p>Nenhuma mensagem ainda</p><p style="font-size: 12px;">Envie uma mensagem para começar</p></div></div>';
+                return;
+            }
+
+            container.innerHTML = messages.map(msg => `
+                <div class="message ${msg.direction === 'outbound' ? 'outgoing' : 'incoming'}">
+                    <div class="message-bubble">
+                        <div class="message-text">${escapeHtml(msg.message)}</div>
+                        <div class="message-time">${formatTime(msg.timestamp)}</div>
+                    </div>
+                </div>
+            `).join('');
+            
+            // Scroll para o final
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // Enviar mensagem
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (!currentPhone || !message) return;
+            
+            try {
+                const response = await fetch('/api/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        phone: currentPhone,
+                        message: message,
+                        instanceName: 'instance1' // Ajuste conforme necessário
+                    })
+                });
+                
+                if (response.ok) {
+                    input.value = '';
+                    await loadMessages(currentPhone);
+                    
+                    // Atualizar última mensagem na lista
+                    const conv = conversations.find(c => c.phone === currentPhone);
+                    if (conv) {
+                        conv.lastMessage = message;
+                        conv.lastTime = new Date().toLocaleTimeString();
+                        renderConversations();
+                    }
+                }
+            } catch (error) {
+                console.error('Erro ao enviar mensagem:', error);
+                alert('Erro ao enviar mensagem');
+            }
+        }
+
+        // Polling para novas mensagens
+        function startPolling(phone) {
+            if (pollInterval) clearInterval(pollInterval);
+            
+            pollInterval = setInterval(async () => {
+                if (currentPhone === phone) {
+                    await loadMessages(phone);
+                    await loadConversations();
+                }
+            }, 3000);
+        }
+
+        // Utilitários
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatTime(timestamp) {
+            if (!timestamp) return '';
+            const date = new Date(timestamp);
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // Busca em tempo real
+        document.getElementById('searchInput').addEventListener('input', () => {
+            renderConversations();
+        });
+
+        // Inicializar
+        loadConversations();
+        
+        // Recarregar conversas a cada 5 segundos
+        setInterval(loadConversations, 5000);
+    </script>
+</body>
+</html>
